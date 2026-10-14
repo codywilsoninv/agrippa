@@ -14,6 +14,9 @@ businesses switch on. Read the founding docs before changing anything structural
 
 If a change conflicts with a founding doc, stop and raise it with Cody rather than working around it.
 
+How the business runs (wedge → engagement → platform → library): `docs/operating-model.md`.
+Every module and project starts with a one-sentence **Solves:** line; don't build without one.
+
 ## Non-negotiables
 - **Isolation:** every workspace-owned table has `workspace_id`, RLS policies via
   `private.is_member` / `private.is_admin`, and composite `(workspace_id, id)` foreign keys.

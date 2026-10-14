@@ -7,6 +7,7 @@ Every module is built to the same template, so any module can be switched on for
 
 ## The template
 
+0. **Solves (one sentence, written first):** the problem this module exists to solve, e.g. "Meeting actions get lost because nobody writes them down and follows up." If it can't be said in one sentence, the module isn't ready to build.
 1. **Identity:** module id and name, version, status (draft / beta / live), owner.
 2. **Decision it serves (fill in first):** the decision in one sentence, in the operator's words; who owns it; the trigger; value (volume per week × cost of getting it wrong or doing it slowly).
 3. **Data:** core types read; core types written; industry-pack types used (optional); what the module stores itself and for how long.
@@ -19,6 +20,7 @@ Every module is built to the same template, so any module can be switched on for
 10. **Metrics (the same three for every module):** time per decision; error rate (denied + edited actions ÷ proposed); volume per operator.
 11. **Telemetry it emits:** list of events (Founding doc 4 says what may and may not be included).
 12. **Release checklist:**
+    - [ ] Solves line written and agreed
     - [ ] Decision section signed off
     - [ ] Reads and writes core types only
     - [ ] Every action has a tier, reversibility and label setting
@@ -29,6 +31,7 @@ Every module is built to the same template, so any module can be switched on for
 ## Worked example: Meeting notes v0.1
 | Field | Value |
 |---|---|
+| Solves | Meeting actions get lost because nobody writes them down, assigns them and follows up. |
 | Decision | "What needs doing after this meeting, and by whom?" |
 | Decision owner | Meeting organiser |
 | Trigger | A new transcript arrives |
