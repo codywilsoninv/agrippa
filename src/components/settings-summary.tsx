@@ -68,6 +68,7 @@ export function SettingsSummary({ settings }: { settings: MessagingSettings }) {
       </Card>
 
       <Card title={`CRM stages (${settings.crm.stages.length})`}>
+        <Muted>Label used when Agrippa sends messages itself: {settings.assistant_label || "not set"}</Muted>
         <Muted>
           Pipeline {settings.crm.pipeline_id} · quiet after {settings.crm.quiet_after_hours}h · offer {settings.slots.offer_count} dates within{" "}
           {settings.slots.lookahead_days} days

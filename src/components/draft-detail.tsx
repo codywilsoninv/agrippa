@@ -7,19 +7,18 @@ import { ThreadHistory } from "@/components/thread-history";
 type Props = {
   draft: DraftRow;
   thread: MessageRow[];
-  assistantLabel: string;
   timezone: string;
   approveAction: (prev: DecisionState, formData: FormData) => Promise<DecisionState>;
   denyAction: (formData: FormData) => void | Promise<void>;
 };
 
-export function DraftDetail({ draft, thread, assistantLabel, timezone, approveAction, denyAction }: Props) {
+export function DraftDetail({ draft, thread, timezone, approveAction, denyAction }: Props) {
   const p = draft.payload;
   const body = draft.edited_payload?.body ?? p.body;
   const subject = draft.edited_payload?.subject ?? p.subject ?? "";
   const priceText = p.price ? `${p.price}${p.price_confidence ? ` · ${p.price_confidence}` : ""}` : "Not quoted";
-  const slotsText =
-    p.slots.length > 0 ? `${p.slots.length} free in Acuity` : p.artist ? "Dates from staff" : "No dates offered";
+  const staffDates = p.flags.some((f) => /dates?\b.*\b(staff|human|manual)|(staff|human|manual)\b.*\bdates?/i.test(f));
+  const slotsText = p.slots.length > 0 ? `${p.slots.length} free in Acuity` : staffDates ? "Dates from staff" : "No dates offered";
   const previousError = draft.status === "approved" && draft.result?.error ? draft.result.error : null;
 
   return (
@@ -69,7 +68,6 @@ export function DraftDetail({ draft, thread, assistantLabel, timezone, approveAc
           channel={p.channel}
           initialSubject={subject}
           initialBody={body}
-          assistantLabel={assistantLabel}
           previousError={previousError}
           approveAction={approveAction}
           denyAction={denyAction}

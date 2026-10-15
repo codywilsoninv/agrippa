@@ -8,7 +8,6 @@ type Props = {
   channel: "sms" | "email";
   initialSubject: string;
   initialBody: string;
-  assistantLabel: string;
   previousError: string | null;
   approveAction: (prev: DecisionState, formData: FormData) => Promise<DecisionState>;
   denyAction: (formData: FormData) => void | Promise<void>;
@@ -20,7 +19,6 @@ export function DraftEditor({
   channel,
   initialSubject,
   initialBody,
-  assistantLabel,
   previousError,
   approveAction,
   denyAction,
@@ -88,7 +86,6 @@ export function DraftEditor({
             className="input-base max-w-[64ch] leading-[1.7]"
           />
         </div>
-        <span className="text-xs text-muted">{assistantLabel}</span>
 
         {error ? (
           <p role="alert" className="rounded-sm bg-danger-soft px-3 py-2 text-sm text-danger">

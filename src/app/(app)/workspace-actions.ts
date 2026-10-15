@@ -6,7 +6,13 @@ import { createClient } from "@/lib/supabase/server";
 import { WORKSPACE_COOKIE, isAdmin, requireWorkspace } from "@/lib/workspace";
 import { audit } from "@/lib/telemetry";
 
-const COOKIE_OPTS = { path: "/", sameSite: "lax" as const, httpOnly: true, maxAge: 60 * 60 * 24 * 365 };
+const COOKIE_OPTS = {
+  path: "/",
+  sameSite: "lax" as const,
+  httpOnly: true,
+  secure: process.env.NODE_ENV === "production",
+  maxAge: 60 * 60 * 24 * 365,
+};
 
 // Pick one of the user's own workspaces. A forged id can't reach anything else:
 // requireWorkspace only honours the cookie if it matches a membership.

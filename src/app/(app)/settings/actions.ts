@@ -6,9 +6,8 @@ import { saveConnection } from "@/lib/connections";
 import { audit } from "@/lib/telemetry";
 import { testPipedrive } from "@/modules/messaging/pipedrive";
 import { testAcuity } from "@/modules/messaging/acuity";
-import { validateSettings } from "@/modules/messaging/sweep";
+import { mergeSettings, validateSettings } from "@/modules/messaging/sweep";
 import { MODULE_ID, type MessagingSettings } from "@/modules/messaging/types";
-import { mergeSettings } from "../messaging/data";
 
 export type FormState = { ok?: string; error?: string; problems?: string[] } | null;
 

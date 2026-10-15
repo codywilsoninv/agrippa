@@ -10,6 +10,8 @@ import { listOpenDrafts, listThread, loadModuleState } from "./data";
 import { approveDraft, denyDraft, sweepNow } from "./actions";
 
 export const metadata = { title: "Messaging · Agrippa" };
+// The manual sweep runs as a server action on this page and can take minutes.
+export const maxDuration = 300;
 
 type Search = Promise<{ d?: string | string[]; done?: string | string[] }>;
 
@@ -51,7 +53,7 @@ export default async function MessagingPage({ searchParams }: { searchParams: Se
 
   const selected = drafts.find((d) => d.id === wanted) ?? drafts[0] ?? null;
   const thread = selected ? await listThread(workspace.id, selected.payload.conversation_id) : [];
-  const oldest = drafts[0]?.proposed_at;
+  const oldest = drafts[0]?.waiting_since;
   const people = new Set(drafts.map((d) => d.payload.person_id ?? d.payload.job_id)).size;
 
   return (
@@ -92,7 +94,6 @@ export default async function MessagingPage({ searchParams }: { searchParams: Se
           <DraftDetail
             draft={selected}
             thread={thread}
-            assistantLabel={module.settings.assistant_label}
             timezone={module.settings.timezone}
             approveAction={approveDraft}
             denyAction={denyDraft}

@@ -18,12 +18,14 @@ export function ThreadHistory({ messages, timezone }: { messages: MessageRow[]; 
           <li
             key={m.id}
             className={`flex max-w-[64ch] flex-col gap-1 rounded-sm px-4 py-3 ${
-              m.direction === "outbound" ? "ml-6 bg-accent-soft" : "bg-surface"
+              m.channel === "note" ? "border border-dashed border-rule-strong bg-panel" : m.direction === "outbound" ? "ml-6 bg-accent-soft" : "bg-surface"
             }`}
           >
             <span className="flex flex-wrap justify-between gap-2 text-xs text-muted">
               <span>
-                {m.direction === "outbound" ? "Us" : m.author || "Client"} · {channelLabel(m.channel)}
+                {m.channel === "note"
+                  ? `Note / transcript${m.author ? ` · ${m.author}` : ""}`
+                  : `${m.direction === "outbound" ? "Us" : m.author || "Client"} · ${channelLabel(m.channel)}`}
               </span>
               <span>{formatDateTime(m.sent_at, timezone)}</span>
             </span>

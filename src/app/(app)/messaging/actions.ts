@@ -17,6 +17,7 @@ type OpenDraft = {
   status: string;
   payload: DraftPayload;
   edited_payload: DraftEdit | null;
+  result: { error?: string; attempts?: number } | null;
 };
 
 // Load one open draft, always scoped to the current workspace. The id comes
@@ -26,7 +27,7 @@ async function loadOpenDraft(workspaceId: string, actionId: string): Promise<Ope
   const supabase = await createClient();
   const { data } = await supabase
     .from("actions")
-    .select("id, status, payload, edited_payload")
+    .select("id, status, payload, edited_payload, result")
     .eq("workspace_id", workspaceId)
     .eq("module_id", MODULE_ID)
     .eq("kind", "draft_reply")
@@ -63,34 +64,42 @@ export async function approveDraft(_prev: DecisionState, formData: FormData): Pr
   if (approveError) return { error: "Couldn't record the approval: " + approveError.message };
 
   await audit(workspace.id, "action.approved", { actorUser: userId, objectType: "action", objectId: draft.id });
-  await emitTelemetry(
-    workspace.id,
-    "messaging.draft_approved",
-    {
-      edited,
-      edit_size: editSize(payload.body.trim(), body),
-      bucket: payload.bucket,
-      channel: payload.channel,
-    },
-    MODULE,
-  );
+
+  // A retry is an approved draft whose earlier CRM save failed. v0.1 accepts
+  // the small chance of a duplicate note; the attempt count is kept on the row.
+  const retry = draft.status === "approved";
+  const attempts = (draft.result?.attempts ?? 0) + 1;
+  const size = editSize(payload.body.trim(), body);
 
   const saved = await saveDraftNoteToCrm(workspace.id, payload, body, subject);
   if (!saved.ok) {
     await supabase
       .from("actions")
-      .update({ result: { error: saved.error } })
+      .update({ result: { error: saved.error, attempts } })
       .eq("workspace_id", workspace.id)
       .eq("id", draft.id);
     return { error: "Approved, but the note didn't reach Pipedrive: " + saved.error + " You can try again or deny." };
   }
 
   const executedAt = new Date().toISOString();
-  await supabase
+  const { error: executeError } = await supabase
     .from("actions")
-    .update({ status: "executed", executed_at: executedAt, result: { note_id: saved.note_id } })
+    .update({ status: "executed", executed_at: executedAt, result: { note_id: saved.note_id, attempts } })
     .eq("workspace_id", workspace.id)
     .eq("id", draft.id);
+  if (executeError) {
+    return {
+      error: `The note was saved to Pipedrive (note ${saved.note_id}) but Agrippa couldn't record it: ${executeError.message}`,
+    };
+  }
+
+  await emitTelemetry(
+    workspace.id,
+    "messaging.draft_approved",
+    { edited, edit_size: size, bucket: payload.bucket, channel: payload.channel, retry },
+    MODULE,
+  );
+  if (edited) await emitTelemetry(workspace.id, "messaging.draft_edited", { edit_size: size }, MODULE);
 
   // The external write gets its own record (Founding doc 3: labelled, approve tier).
   await supabase.from("actions").insert({

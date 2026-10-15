@@ -64,7 +64,7 @@ export default async function SettingsPage({ searchParams }: { searchParams: Sea
             canEdit={admin}
             action={savePipedrive}
             fields={[
-              { name: "company_domain", label: "Company domain", placeholder: "umbratattoo", hint: "The first part of your Pipedrive address: <domain>.pipedrive.com" },
+              { name: "company_domain", label: "Company domain", placeholder: "yourcompany", hint: "The first part of your Pipedrive address: <domain>.pipedrive.com" },
               { name: "api_token", label: "API token", type: "password", hint: "Pipedrive: Settings, Personal preferences, API." },
             ]}
           />

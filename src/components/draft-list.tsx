@@ -41,7 +41,7 @@ export function DraftList({ drafts, selectedId }: { drafts: DraftRow[]; selected
                   <span className="flex w-full justify-between gap-3">
                     <strong className="font-semibold">{d.payload.client_name || "Unknown client"}</strong>
                     <span className="shrink-0 text-xs text-muted">
-                      {channelLabel(d.payload.channel)} · {relativeAge(d.proposed_at)}
+                      {channelLabel(d.payload.channel)} · {relativeAge(d.waiting_since)}
                     </span>
                   </span>
                   <span className={selected ? "text-ink-soft" : "text-muted"}>

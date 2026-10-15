@@ -1,6 +1,7 @@
 import "server-only";
 import { createClient } from "@/lib/supabase/server";
-import { DEFAULT_SETTINGS, type DraftEdit, type DraftPayload, type MessagingSettings } from "@/modules/messaging/types";
+import type { DraftEdit, DraftPayload, MessagingSettings } from "@/modules/messaging/types";
+import { mergeSettings } from "@/modules/messaging/sweep";
 
 // Reads for the Messaging screens. Everything goes through the signed-in
 // user's client (row-level security) and is filtered by workspace id.
@@ -12,7 +13,9 @@ export type DraftRow = {
   edited_payload: DraftEdit | null;
   proposed_at: string;
   decided_at: string | null;
-  result: { note_id?: number; error?: string } | null;
+  result: { note_id?: number; error?: string; attempts?: number } | null;
+  /** When the client last wrote to us (latest inbound message), else proposed_at. */
+  waiting_since: string;
 };
 
 export type MessageRow = {
@@ -25,19 +28,6 @@ export type MessageRow = {
 };
 
 export type ModuleState = { enabled: boolean; settings: MessagingSettings };
-
-export function mergeSettings(raw: unknown): MessagingSettings {
-  const s = (raw && typeof raw === "object" ? raw : {}) as Partial<MessagingSettings>;
-  return {
-    ...DEFAULT_SETTINGS,
-    ...s,
-    crm: { ...DEFAULT_SETTINGS.crm, ...(s.crm ?? {}) },
-    slots: { ...DEFAULT_SETTINGS.slots, ...(s.slots ?? {}) },
-    artists: Array.isArray(s.artists) ? s.artists : [],
-    styles: Array.isArray(s.styles) ? s.styles : [],
-    banned_words: Array.isArray(s.banned_words) ? s.banned_words : [],
-  };
-}
 
 export async function loadModuleState(workspaceId: string): Promise<ModuleState> {
   const supabase = await createClient();
@@ -62,7 +52,33 @@ export async function listOpenDrafts(workspaceId: string): Promise<DraftRow[]> {
     .eq("kind", "draft_reply")
     .or("status.eq.proposed,and(status.eq.approved,executed_at.is.null)")
     .order("proposed_at", { ascending: true });
-  return (data ?? []) as DraftRow[];
+  const rows = (data ?? []) as Omit<DraftRow, "waiting_since">[];
+  const since = await latestInbound(
+    workspaceId,
+    rows.map((r) => r.payload.conversation_id).filter((id): id is string => Boolean(id)),
+  );
+  return rows
+    .map((r) => ({ ...r, waiting_since: (r.payload.conversation_id && since.get(r.payload.conversation_id)) || r.proposed_at }))
+    .sort((a, b) => a.waiting_since.localeCompare(b.waiting_since));
+}
+
+// Latest inbound message per conversation, one query for the whole list.
+async function latestInbound(workspaceId: string, conversationIds: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  if (conversationIds.length === 0) return out;
+  const supabase = await createClient();
+  const { data } = await supabase
+    .from("messages")
+    .select("conversation_id, sent_at")
+    .eq("workspace_id", workspaceId)
+    .eq("direction", "inbound")
+    .in("conversation_id", conversationIds)
+    .order("sent_at", { ascending: false })
+    .limit(2000);
+  for (const m of (data ?? []) as { conversation_id: string; sent_at: string }[]) {
+    if (!out.has(m.conversation_id)) out.set(m.conversation_id, m.sent_at);
+  }
+  return out;
 }
 
 export async function listThread(workspaceId: string, conversationId: string | null): Promise<MessageRow[]> {
