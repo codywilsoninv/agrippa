@@ -48,12 +48,15 @@ export async function saveConnection<P extends Provider>(
 
   let id = existing?.id as string | undefined;
   if (id) {
-    const { error } = await supabase
+    // Under RLS a non-admin update affects 0 rows WITHOUT an error, so check the
+    // returned rows: no row back means not allowed, and the secret must not be written.
+    const { data: updated, error } = await supabase
       .from("connections")
       .update({ status: "connected", external_account: externalAccount })
       .eq("id", id)
-      .eq("workspace_id", workspaceId);
-    if (error) throw new Error("Only workspace admins can change connections.");
+      .eq("workspace_id", workspaceId)
+      .select("id");
+    if (error || !updated || updated.length === 0) throw new Error("Only workspace admins can change connections.");
   } else {
     const { data, error } = await supabase
       .from("connections")
