@@ -61,7 +61,7 @@ Listens for Items of kind: `crm_deal_created`, `crm_activity_logged` (inbound SM
 ## 6. Brain
 | Part | Where |
 |---|---|
-| Generic instructions | `modules/messaging/brain/instructions.md` (versioned in repo) |
+| Generic instructions | `src/modules/messaging/brain/instructions.md` (versioned in repo) |
 | Company voice and examples | Workspace memory (Umbra: Cody's voice, banned words, worked examples) |
 | Price book | Company-layer data (table), not prompt text |
 | Routing rule | Business rules + a routing table (style × artist rank). Hard conditions, not AI instructions: "soonest slot wins", "never route to an artist who runs their own books", "never offer a date that isn't free in Acuity" |
@@ -91,7 +91,7 @@ Hard rules (conditions, checked in code before a draft is shown):
 | Assistant tools | "Make it shorter", "offer later dates", "switch artist", "redo as SMS", approve / deny |
 
 ## 9. Tests
-Test set: `modules/messaging/tests/` — 30 real past Umbra enquiries (names stripped) with the reply Cody actually sent. Pass bar to release a version: no hard-rule breaches, and ≥ 70% of drafts judged "send with light edits or none".
+Test set: `tests/unit/` (routing and hard rules) now; `src/modules/messaging/tests/` — 30 real past Umbra enquiries (names stripped) with the reply Cody actually sent. Pass bar to release a version: no hard-rule breaches, and ≥ 70% of drafts judged "send with light edits or none".
 
 ## 10. Metrics
 | Metric | Umbra meaning |
