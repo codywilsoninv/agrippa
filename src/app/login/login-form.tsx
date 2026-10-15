@@ -26,15 +26,15 @@ export function LoginForm() {
 
   if (state === "sent") {
     return (
-      <p className="text-sm bg-[#DCFCE7] text-[#14532D] rounded-lg p-4">
-        Check your inbox for a sign-in link sent to <strong>{email}</strong>.
+      <p role="status" className="m-0 rounded-sm bg-ok-soft p-4 text-sm text-ok">
+        Check your inbox for a sign-in link sent to <strong className="font-semibold">{email}</strong>.
       </p>
     );
   }
 
   return (
     <form onSubmit={onSubmit} className="flex flex-col gap-3">
-      <label htmlFor="email" className="text-sm font-medium">
+      <label htmlFor="email" className="label-caps">
         Email
       </label>
       <input
@@ -44,17 +44,13 @@ export function LoginForm() {
         autoComplete="email"
         value={email}
         onChange={(e) => setEmail(e.target.value)}
-        className="min-h-11 rounded-lg border border-[#D6D3CA] px-3"
+        className="input-base"
       />
-      <button
-        type="submit"
-        disabled={state === "sending"}
-        className="min-h-11 rounded-lg bg-[#1A1B1E] text-white font-semibold disabled:opacity-60"
-      >
+      <button type="submit" disabled={state === "sending"} className="btn-primary disabled:opacity-60">
         {state === "sending" ? "Sending…" : "Send sign-in link"}
       </button>
       {state === "error" && (
-        <p role="alert" className="text-sm text-[#B91C1C]">
+        <p role="alert" className="m-0 text-sm text-danger">
           {message}
         </p>
       )}
