@@ -14,7 +14,7 @@ const db = new PGlite();
 
 const A = "00000000-0000-0000-0000-00000000000a";
 const B = "00000000-0000-0000-0000-00000000000b";
-let wsA, wsB, clientWs, convA;
+let wsB, clientWs, convA;
 
 const SUPABASE_STUB = `
   create role anon nologin;
@@ -49,7 +49,6 @@ before(async () => {
   }
   await db.exec(SUPABASE_GRANTS);
   await db.exec(`insert into auth.users (id, email) values ('${A}', 'alice@example.com'), ('${B}', 'bob@example.com');`);
-  wsA = (await db.query(`select workspace_id from public.memberships where user_id = $1`, [A])).rows[0].workspace_id;
   wsB = (await db.query(`select workspace_id from public.memberships where user_id = $1`, [B])).rows[0].workspace_id;
 });
 

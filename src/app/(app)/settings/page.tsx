@@ -4,6 +4,7 @@ import { createClient } from "@/lib/supabase/server";
 import { ConnectionForm } from "@/components/connection-form";
 import { SettingsEditor } from "@/components/settings-editor";
 import { SettingsSummary } from "@/components/settings-summary";
+import { AcuityReference } from "@/components/acuity-reference";
 import { WorkspaceRename } from "@/components/workspace-rename";
 import { formatDateTime } from "@/components/format";
 import { loadModuleState } from "../messaging/data";
@@ -97,6 +98,7 @@ export default async function SettingsPage({ searchParams }: { searchParams: Sea
           ) : null}
         </div>
         <SettingsSummary settings={module.settings} />
+        {admin ? <AcuityReference workspaceId={workspace.id} /> : null}
         <SettingsEditor initialJson={settingsJson} canEdit={admin} action={saveSettings} />
       </section>
 
