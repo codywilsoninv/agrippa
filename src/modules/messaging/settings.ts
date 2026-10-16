@@ -1,6 +1,7 @@
 // Messaging module: settings shape and validation. PURE (type imports only),
 // so the UI, the sweep and the unit tests share one source of truth.
 
+import { isKnownCountry, toE164 } from "./phone.ts";
 import { DEFAULT_SETTINGS, type MessagingSettings } from "./types.ts";
 
 /** Whatever is in workspace_modules.settings, merged over the defaults so it always has a shape. */
@@ -9,7 +10,11 @@ export function mergeSettings(raw: unknown): MessagingSettings {
   return {
     ...DEFAULT_SETTINGS,
     ...stored,
-    crm: { ...DEFAULT_SETTINGS.crm, ...(stored.crm ?? {}) },
+    crm: {
+      ...DEFAULT_SETTINGS.crm,
+      ...(stored.crm ?? {}),
+      ignore_phone_numbers: Array.isArray(stored.crm?.ignore_phone_numbers) ? stored.crm.ignore_phone_numbers : [],
+    },
     slots: { ...DEFAULT_SETTINGS.slots, ...(stored.slots ?? {}) },
     artists: Array.isArray(stored.artists) ? stored.artists : [],
     styles: Array.isArray(stored.styles) ? stored.styles : [],
@@ -25,6 +30,8 @@ export function validateSettings(s: MessagingSettings): string[] {
   if (!s.timezone.trim() || !isValidTimezone(s.timezone)) problems.push("Timezone is missing or not a valid IANA zone.");
   if (!s.voice.trim()) problems.push("Voice is empty: the drafts would have no tone to follow.");
   if (!s.email_subject.trim()) problems.push("Email subject is empty.");
+  if (!isKnownCountry(s.country)) problems.push(`Country "${s.country}" isn't one Agrippa knows how to read phone numbers for (AU, NZ, GB, US).`);
+  for (const n of s.crm.ignore_phone_numbers) if (!toE164(n, s.country)) problems.push(`ignore_phone_numbers: "${n}" isn't a phone number.`);
   if (s.artists.length === 0) problems.push("No artists on the roster.");
   if (!s.artists.some((a) => a.active && a.in_house)) problems.push("Nobody on the roster is both active and in-house, so no one can be offered.");
   for (const a of s.artists) {

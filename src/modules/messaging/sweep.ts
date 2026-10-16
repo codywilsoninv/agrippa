@@ -13,8 +13,8 @@ import { audit, emitTelemetry } from "@/lib/telemetry";
 import { AcuityClient } from "./acuity";
 import { BrainError, classifyEnquiry, draftReply, sumUsage, type DraftInput, type ThreadMessage } from "./brain";
 import { ClickSendClient, type SmsRecord } from "./clicksend";
-import { maskPhone, samePhone, searchDigits, toE164 } from "./phone";
-import { groupTexts, pickRelevantDeal, type TextThread } from "./texts";
+import { samePhone, searchVariants, toE164 } from "./phone";
+import { groupTexts, lastInboundAt, pickRelevantDeal, type TextThread } from "./texts";
 import {
   PipedriveClient,
   noteToText,
@@ -123,7 +123,7 @@ export async function runSweep(workspaceId: string, opts: { trigger: "manual" | 
   // 2. Decide who is waiting on us: deals first, then every text thread the CRM
   // doesn't surface (won, lost, booked, or no deal at all).
   const dealCandidates = await shortlistDeals(crm, settings, deals, activities, nowIso, report);
-  const threads = groupTexts(records);
+  const threads = groupTexts(records, settings.country, settings.crm.ignore_phone_numbers);
   const shortlist = await mergeTextThreads(crm, settings, dealCandidates, threads, report);
   const slotFinder = createSlotFinder(acuity, settings, nowIso);
 
@@ -191,7 +191,9 @@ async function shortlistDeals(
       report.skipped += 1; // no contact, or outside the configured pipeline
       continue;
     }
-    // Stage gate first: a deal in a booked/ignored/unmapped stage is never drafted, even with an unreplied text.
+    // Stage gate first. 'ignore' is the business opting out: never drafted, even
+    // when a text arrives (see mergeTextThreads). 'booked' deals are left to the
+    // text threads, which can still surface them when the client writes.
     const stage = stageById.get(deal.stage_id) ?? null;
     const treat = stage?.treat_as ?? "ignore";
     if (treat === "booked" || treat === "ignore") {
@@ -240,7 +242,7 @@ async function shortlistDeals(
       return;
     }
     const notes = (await crm.getDealNotes(p.deal.id)).filter((n) => !DRAFT_NOTE_RE.test(noteToText(n.content)));
-    out.push({ ...p, key: `deal ${p.deal.id}`, person, phone: toE164(person.phone), stageName: p.stage?.name ?? null, notes, texts: [] });
+    out.push({ ...p, key: `deal ${p.deal.id}`, person, phone: toE164(person.phone, settings.country), stageName: p.stage?.name ?? null, notes, texts: [] });
   });
 
   // Duplicate deals for the same person (chatbot + form): keep the one with the conversation.
@@ -279,7 +281,8 @@ function activityTime(a: PipedriveActivity): Date {
 /**
  * Attach each thread to its deal candidate when the number matches, and make a
  * new candidate for every unreplied thread the deal sweep didn't surface. An
- * unreplied text is urgent regardless of deal status (won, lost, booked, none).
+ * unreplied text is urgent regardless of deal status (won, lost, booked, none),
+ * except for deals the business has opted out of (stage treat_as 'ignore').
  */
 async function mergeTextThreads(
   crm: PipedriveClient,
@@ -289,27 +292,57 @@ async function mergeTextThreads(
   report: SweepReport,
 ): Promise<Candidate[]> {
   const skipNames = new Set(settings.crm.skip_contact_names.map((n) => n.trim().toLowerCase()));
+  const stageById = new Map(settings.crm.stages.map((s) => [s.id, s]));
+  const quietMs = settings.crm.quiet_after_hours * 3_600_000;
+  const now = Date.now();
   const matched = new Set<string>();
 
-  // Threads with a shortlisted deal: give the deal the text history; an unreplied text wins the bucket.
+  // Threads with a shortlisted deal: give the deal the text history. A text
+  // either way is a human touch: an unreplied one wins the bucket; a reply we
+  // sent means the deal is neither new nor quiet.
+  const kept: Candidate[] = [];
   for (const c of dealCandidates) {
-    const t = threads.find((th) => c.person?.phones.some((p) => samePhone(p, th.phone)));
-    if (!t) continue;
+    const t = threads.find((th) => c.person?.phones.some((p) => samePhone(p, th.phone, settings.country)));
+    if (!t) {
+      kept.push(c);
+      continue;
+    }
     matched.add(t.phone);
     c.texts = t.texts;
     c.phone = t.phone;
     if (t.unreplied) c.bucket = "unreplied";
+    else {
+      const lastText = new Date(t.texts[t.texts.length - 1].at).getTime();
+      if (c.bucket === "new" || (c.bucket === "quiet" && now - lastText < quietMs)) {
+        report.skipped += 1; // we've already replied by text
+        continue;
+      }
+    }
+    kept.push(c);
   }
 
-  // Unreplied threads with no shortlisted deal: look the number up and draft anyway.
+  // Unreplied threads with no shortlisted deal: most recent first, capped
+  // BEFORE any lookups so a backlog can't blow the time budget.
+  const unmatched = threads
+    .filter((t) => t.unreplied && !matched.has(t.phone))
+    .sort((x, y) => lastInboundAt(y.texts) - lastInboundAt(x.texts));
+  const budget = Math.max(0, MAX_CLIENTS_PER_SWEEP - kept.filter((c) => c.bucket === "unreplied").length);
+  if (unmatched.length > budget) report.skipped += unmatched.length - budget;
+
+  const lookup = createPersonLookup(crm, settings.country);
   const extra: Candidate[] = [];
-  const unmatched = threads.filter((t) => t.unreplied && !matched.has(t.phone));
   let stages: Map<number, { name: string; pipeline_id: number }> | null = null;
-  const stageById = new Map(settings.crm.stages.map((s) => [s.id, s]));
-  await runLimited(unmatched, CONCURRENCY, async (t) => {
-    const index = unmatched.indexOf(t) + 1;
-    const key = `text thread ${index}`;
-    const person = await findPersonByPhone(crm, t.phone);
+  // Concurrency 1: the person search is several CRM calls per number and rate limits bite.
+  await runLimited(unmatched.slice(0, budget), 1, async (t) => {
+    const key = `text thread ${unmatched.indexOf(t) + 1}`;
+    let person: PipedrivePerson | null;
+    try {
+      person = await lookup(t.phone);
+    } catch (e) {
+      // No number in the report: the key is enough to find it in the sweep log.
+      report.errors.push(`${key}: couldn't look the number up in Pipedrive (${e instanceof Error ? e.message.slice(0, 80) : "error"})`);
+      return;
+    }
     if (person && skipNames.has(person.name.trim().toLowerCase())) {
       report.skipped += 1;
       return;
@@ -321,6 +354,10 @@ async function mergeTextThreads(
       if (deal) notes = (await crm.getDealNotes(deal.id)).filter((n) => !DRAFT_NOTE_RE.test(noteToText(n.content)));
     }
     const stage = deal ? (stageById.get(deal.stage_id) ?? null) : null;
+    if (stage?.treat_as === "ignore") {
+      report.skipped += 1; // the business opted this stage out
+      return;
+    }
     let stageName = stage?.name ?? null;
     if (deal && !stageName) {
       stages ??= await crm.listStages();
@@ -329,24 +366,46 @@ async function mergeTextThreads(
     extra.push({ key, bucket: "unreplied", person, phone: t.phone, deal, stage, stageName, notes, sms: [], texts: t.texts });
   });
 
+  // One draft per number (two CRM persons sharing a phone) and per person.
+  const seenPhone = new Set<string>();
+  const seenPerson = new Set<number>();
+  const all = [...kept, ...extra].filter((c) => {
+    if (c.phone && seenPhone.has(c.phone)) {
+      report.skipped += 1;
+      return false;
+    }
+    if (c.person && seenPerson.has(c.person.id)) {
+      report.skipped += 1;
+      return false;
+    }
+    if (c.phone) seenPhone.add(c.phone);
+    if (c.person) seenPerson.add(c.person.id);
+    return true;
+  });
+
+  // Deterministic: by bucket, then most recent inbound text first, then deal id.
   const order: Record<Bucket, number> = { unreplied: 0, new: 1, quiet: 2 };
-  return [...dealCandidates, ...extra].sort((a, b) => order[a.bucket] - order[b.bucket]);
+  return all.sort(
+    (a, b) => order[a.bucket] - order[b.bucket] || lastInboundAt(b.texts) - lastInboundAt(a.texts) || (b.deal?.id ?? 0) - (a.deal?.id ?? 0),
+  );
 }
 
-const personByPhone = new Map<string, Promise<PipedrivePerson | null>>();
-
-/** CRM person for a number, cached per process. Search by the national digits, then confirm with a strict compare. */
-function findPersonByPhone(crm: PipedriveClient, phone: string): Promise<PipedrivePerson | null> {
-  let p = personByPhone.get(phone);
-  if (!p) {
-    p = crm
-      .searchPersonsByPhone(searchDigits(phone))
-      .then((people) => people.find((x) => x.phones.some((n) => samePhone(n, phone))) ?? null)
-      .catch(() => null);
-    personByPhone.set(phone, p);
-    setTimeout(() => personByPhone.delete(phone), 10 * 60_000).unref?.();
-  }
-  return p;
+/**
+ * CRM person for a number, cached for ONE sweep (never module-level: the cache
+ * would leak across workspaces). Searches every spelling, then confirms with a
+ * strict compare. Errors propagate so the caller can report and skip.
+ */
+function createPersonLookup(crm: PipedriveClient, country: string): (phone: string) => Promise<PipedrivePerson | null> {
+  const cache = new Map<string, Promise<PipedrivePerson | null>>();
+  return (phone) => {
+    let p = cache.get(phone);
+    if (!p) {
+      p = crm.searchPersonsByPhone(searchVariants(phone, country)).then((people) => people.find((x) => x.phones.some((n) => samePhone(n, phone, country))) ?? null);
+      p.catch(() => cache.delete(phone)); // don't cache a failure
+      cache.set(phone, p);
+    }
+    return p;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +456,14 @@ async function processCandidate(args: ProcessArgs): Promise<"proposed" | "skippe
         custom: { messaging: { phone } },
       });
 
+  // Texts that arrived before we knew the deal live on a stand-in job keyed by
+  // the number. Fold it into the deal's job so there is one draft and one history.
+  let mergedDecidedAt: string | null = null;
+  if (deal && phone) {
+    const standIn = await smsStore.findJob(`sms:${phone}`);
+    if (standIn && standIn !== jobId) mergedDecidedAt = await smsStore.mergeJobInto(standIn, jobId);
+  }
+
   const conversationIds: string[] = [];
   let newMessages = 0;
   if (deal) {
@@ -433,13 +500,18 @@ async function processCandidate(args: ProcessArgs): Promise<"proposed" | "skippe
   // A proposed draft stays unless something new came in since.
   if (open && newMessages === 0 && !inboundAfter(open.proposed_at)) return "skipped";
   // The last draft was dealt with: only draft again once the client has written back.
-  const decidedAt = open ? null : await crmStore.lastDecidedAt(jobId);
+  const decidedAt = open ? null : [await crmStore.lastDecidedAt(jobId), mergedDecidedAt].filter((x): x is string => !!x).sort().pop() ?? null;
   if (decidedAt && !inboundAfter(decidedAt)) return "skipped";
+  // A courtesy sign-off was already judged as needing no reply: don't pay to classify it again.
+  const memo = await crmStore.jobMessaging(jobId);
+  const lastClassified = typeof memo.last_classified_inbound_at === "string" ? memo.last_classified_inbound_at : null;
+  if (memo.courtesy_only === true && lastClassified && !inboundAfter(lastClassified)) return "skipped";
 
   // Classify.
   const thread = await crmStore.loadThread(conversationIds);
   const brainThread: ThreadMessage[] = thread.map((m) => ({ direction: m.direction, channel: m.channel, author: m.author, body: m.body, sent_at: m.sent_at }));
   const { classification, usage: classifyUsage } = await classifyEnquiry(settings, brainThread);
+  await crmStore.patchJobMessaging(jobId, { last_classified_inbound_at: latestInbound, courtesy_only: classification.courtesy_only });
   if (classification.courtesy_only && bucket !== "new") return "skipped";
 
   // Route and pick dates (code, not the model).
@@ -469,15 +541,16 @@ async function processCandidate(args: ProcessArgs): Promise<"proposed" | "skippe
 
   const lastInboundMsg = [...brainThread].reverse().find((m) => m.direction === "inbound");
   const extraFlags: string[] = [];
-  if (!person) extraFlags.push(`Unknown number: no Pipedrive person has this phone (${maskPhone(phone ?? "")}). Check who it is; the note can't be saved to a deal.`);
+  if (!person) extraFlags.push(`Unknown number: no Pipedrive person has the phone ${phone ?? ""}. Check who it is; the note can't be saved to a deal.`);
   else if (!deal) extraFlags.push("This person has no deal in Pipedrive, so the note can't be saved to a deal.");
   else if (booked) extraFlags.push(`Already booked (deal "${deal.title}"${candidate.stageName ? `, ${candidate.stageName}` : ""}): check the draft answers what they asked and doesn't re-quote.`);
   const contactEmail = person?.email ?? null;
-  const contactPhone = phone ?? toE164(person?.phone) ?? person?.phone ?? null;
+  const contactPhone = phone ?? toE164(person?.phone, settings.country) ?? person?.phone ?? null;
   const payload: DraftPayload = {
     job_id: jobId,
     person_id: personId,
     conversation_id: conversationIds[conversationIds.length - 1] ?? null,
+    conversation_ids: conversationIds,
     client_name: clientName,
     bucket,
     waiting_for: result.draft.waiting_for || classification.summary,

@@ -82,7 +82,7 @@ export class PipedriveClient {
     this.token = secrets.api_token;
   }
 
-  private async request<T>(method: "GET" | "POST", path: string, params: Record<string, string | number | undefined> = {}, body?: unknown): Promise<Envelope<T>> {
+  private async request<T>(method: "GET" | "POST", path: string, params: Record<string, string | number | undefined> = {}, body?: unknown, retried = false): Promise<Envelope<T>> {
     const url = new URL(path, this.base);
     for (const [k, v] of Object.entries(params)) if (v !== undefined) url.searchParams.set(k, String(v));
     url.searchParams.set("api_token", this.token);
@@ -99,11 +99,20 @@ export class PipedriveClient {
       throw new Error(`Couldn't reach Pipedrive (${path}): ${e instanceof Error ? e.message : "network error"}`);
     }
 
+    // Rate limited: wait what Pipedrive asks (capped), retry once.
+    if (res.status === 429 && !retried) {
+      const after = Number(res.headers.get("retry-after"));
+      const waitMs = Math.min(Number.isFinite(after) && after > 0 ? after * 1000 : 2000, 10_000);
+      await new Promise((r) => setTimeout(r, waitMs));
+      return this.request<T>(method, path, params, body, true);
+    }
+
     const json = (await res.json().catch(() => null)) as Envelope<T> | null;
     if (!res.ok || !json || json.success === false) {
       // Never echo the URL: it carries the token.
       const detail = json?.error ?? `HTTP ${res.status}`;
       if (res.status === 401) throw new Error("Pipedrive rejected the API token");
+      if (res.status === 429) throw new Error("Pipedrive rate limit hit; try the sweep again in a minute");
       throw new Error(`Pipedrive ${method} ${path} failed: ${detail}`);
     }
     return json;
@@ -224,21 +233,28 @@ export class PipedriveClient {
   }
 
   /**
-   * People whose phone contains the digits (v2 search, `fields=phone`). Callers
-   * pass the national significant number so stored formats don't matter.
+   * People whose phone matches any of the spellings (v2 search, `fields=phone`),
+   * unioned by person id. Callers confirm the match strictly afterwards.
    */
-  async searchPersonsByPhone(digits: string): Promise<PipedrivePerson[]> {
+  async searchPersonsByPhone(variants: string[]): Promise<PipedrivePerson[]> {
     type Item = { item: { id: number; name: string; phones?: string[]; emails?: string[] } };
-    const r = await this.request<{ items: Item[] } | null>("GET", "/api/v2/persons/search", { term: digits, fields: "phone", limit: 20 });
-    return (r.data?.items ?? []).map(({ item }) => ({
-      id: item.id,
-      name: item.name,
-      email: item.emails?.[0] ?? null,
-      phone: item.phones?.[0] ?? null,
-      emails: item.emails ?? [],
-      phones: item.phones ?? [],
-      add_time: "",
-    }));
+    const byId = new Map<number, PipedrivePerson>();
+    for (const term of [...new Set(variants.filter((v) => v.trim().length >= 2))]) {
+      const r = await this.request<{ items: Item[] } | null>("GET", "/api/v2/persons/search", { term, fields: "phone", limit: 20 });
+      for (const { item } of r.data?.items ?? []) {
+        if (byId.has(item.id)) continue;
+        byId.set(item.id, {
+          id: item.id,
+          name: item.name,
+          email: item.emails?.[0] ?? null,
+          phone: item.phones?.[0] ?? null,
+          emails: item.emails ?? [],
+          phones: item.phones ?? [],
+          add_time: "",
+        });
+      }
+    }
+    return [...byId.values()];
   }
 
   /** Every non-deleted deal of a person (open, won, lost), newest update first. */

@@ -49,6 +49,8 @@ export type MessagingSettings = {
   /** The person replies are written as (signs off). */
   sender_name: string;
   timezone: string; // IANA, e.g. Australia/Melbourne
+  /** ISO 3166-1 alpha-2; how local phone numbers without a country code are read. */
+  country: string;
   /** Label required by Founding doc 3 for anything sent on someone's behalf. */
   assistant_label: string;
   /** How the business writes to clients: tone, structure, banned words, worked examples. */
@@ -78,6 +80,8 @@ export type MessagingSettings = {
     sms_outbound_prefix: string;
     /** Regex (case-insensitive) that marks a deal note as a chatbot transcript. */
     chatbot_note_pattern: string;
+    /** E.164 numbers whose texts are never drafted for (staff, the business's own numbers). */
+    ignore_phone_numbers: string[];
   };
   slots: {
     /** How many dates to offer. */
@@ -91,6 +95,7 @@ export const DEFAULT_SETTINGS: MessagingSettings = {
   business_name: "",
   sender_name: "",
   timezone: "Australia/Melbourne",
+  country: "AU",
   assistant_label: "Sent by our assistant",
   voice: "",
   price_book: "",
@@ -108,6 +113,7 @@ export const DEFAULT_SETTINGS: MessagingSettings = {
     sms_inbound_prefix: "Received SMS from",
     sms_outbound_prefix: "SMS Sent to",
     chatbot_note_pattern: "chat|bot",
+    ignore_phone_numbers: [],
   },
   slots: { offer_count: 3, lookahead_days: 42 },
 };
@@ -138,6 +144,8 @@ export type DraftPayload = {
   rationale: string;
   /** Things the approver must do or check themselves. Never sent. */
   flags: string[];
+  /** Every conversation the draft drew on (deal notes, texts). conversation_id is the last of them, kept for compatibility. */
+  conversation_ids?: string[];
   /** Short quote from the enquiry, for context on screen. */
   enquiry_excerpt: string;
   contact: { email: string | null; phone: string | null; preferred: "sms" | "email" | null };

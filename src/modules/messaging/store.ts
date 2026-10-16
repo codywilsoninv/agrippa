@@ -51,8 +51,12 @@ export type MessageInput = {
 
 export type OpenDraft = { id: string; status: "proposed" | "approved"; proposed_at: string; payload: DraftPayload };
 
+// Postgres error text can echo the values in a failed row (names, numbers),
+// and report.errors is shown on screen and kept in the audit trail, so only a
+// fixed message leaves this file.
 function fail(what: string, error: { message: string } | null): never {
-  throw new Error(`${what}: ${error?.message ?? "unknown error"}`);
+  void error; // deliberately not surfaced
+  throw new Error(`${what} (database error)`);
 }
 
 export function createStore(workspaceId: string, connectionId: string, db: SupabaseClient = createAdminClient()) {
@@ -272,7 +276,56 @@ export function createStore(workspaceId: string, connectionId: string, db: Supab
     }));
   }
 
-  return { upsertPerson, upsertJob, upsertConversation, addMessages, openDraft, lastDecidedAt, latestInboundAt, replaceDraft, loadThread };
+  /** Id of a job by its external key on this connection, or null. */
+  async function findJob(externalId: string): Promise<string | null> {
+    return findBySource("jobs", externalId);
+  }
+
+  /** jobs.custom.messaging for a job (empty object when unset). */
+  async function jobMessaging(jobId: string): Promise<Record<string, unknown>> {
+    const { data, error } = await db.from("jobs").select("custom").eq("workspace_id", ws).eq("id", jobId).maybeSingle();
+    if (error) fail("Couldn't read job", error);
+    const custom = (data?.custom && typeof data.custom === "object" ? data.custom : {}) as Record<string, unknown>;
+    return (custom.messaging && typeof custom.messaging === "object" ? custom.messaging : {}) as Record<string, unknown>;
+  }
+
+  /** Merge a patch into jobs.custom.messaging (the module's namespace), leaving the company's fields alone. */
+  async function patchJobMessaging(jobId: string, patch: Record<string, unknown>): Promise<void> {
+    const { data, error: readError } = await db.from("jobs").select("custom").eq("workspace_id", ws).eq("id", jobId).maybeSingle();
+    if (readError) fail("Couldn't read job", readError);
+    const custom = (data?.custom && typeof data.custom === "object" ? data.custom : {}) as Record<string, unknown>;
+    const messaging = (custom.messaging && typeof custom.messaging === "object" ? custom.messaging : {}) as Record<string, unknown>;
+    const { error } = await db
+      .from("jobs")
+      .update({ custom: { ...custom, messaging: { ...messaging, ...patch } }, updated_at: new Date().toISOString() })
+      .eq("workspace_id", ws)
+      .eq("id", jobId);
+    if (error) fail("Couldn't update job", error);
+  }
+
+  /**
+   * Fold a stand-in job (texts from a number before we knew the deal) into the
+   * real one: cancel its open draft, mark it merged, and hand back when its
+   * last draft was decided so the deal job honours the same no-re-draft rule.
+   */
+  async function mergeJobInto(fromJobId: string, intoJobId: string): Promise<string | null> {
+    const { error: cancelError } = await db
+      .from("actions")
+      .update({ status: "cancelled", decided_at: new Date().toISOString() })
+      .eq("workspace_id", ws)
+      .eq("module_id", MODULE_ID)
+      .eq("kind", "draft_reply")
+      .eq("status", "proposed")
+      .eq("source->>job_id", fromJobId);
+    if (cancelError) fail("Couldn't cancel the stand-in draft", cancelError);
+    const decided = await lastDecidedAt(fromJobId);
+    await patchJobMessaging(fromJobId, { merged_into: intoJobId });
+    const { error } = await db.from("jobs").update({ status: "merged", updated_at: new Date().toISOString() }).eq("workspace_id", ws).eq("id", fromJobId);
+    if (error) fail("Couldn't close the stand-in job", error);
+    return decided;
+  }
+
+  return { upsertPerson, upsertJob, findJob, patchJobMessaging, jobMessaging, mergeJobInto, upsertConversation, addMessages, openDraft, lastDecidedAt, latestInboundAt, replaceDraft, loadThread };
 }
 
 /** Settings row for the module, or null when not enabled. */
