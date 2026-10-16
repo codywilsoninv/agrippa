@@ -24,6 +24,8 @@ export type PersonInput = {
 
 export type JobInput = {
   external_id: string;
+  /** 'enquiry' (a CRM deal) or 'sms_only' (texts from a number with no deal). */
+  subtype?: "enquiry" | "sms_only";
   title: string;
   status: string;
   client_person_id: string | null;
@@ -32,7 +34,7 @@ export type JobInput = {
 
 export type ConversationInput = {
   external_id: string;
-  job_id: string;
+  job_id: string | null;
   subtype: "sms" | "email_thread" | "chatbot" | "form";
   occurred_at: string;
   title: string | null;
@@ -98,7 +100,7 @@ export function createStore(workspaceId: string, connectionId: string, db: Supab
     }
     const { data, error } = await db
       .from("jobs")
-      .insert({ ...row, workspace_id: ws, subtype: "enquiry", source_connection_id: conn, source_external_id: j.external_id, created_by_module: MODULE_ID })
+      .insert({ ...row, workspace_id: ws, subtype: j.subtype ?? "enquiry", source_connection_id: conn, source_external_id: j.external_id, created_by_module: MODULE_ID })
       .select("id")
       .single();
     if (error || !data) fail("Couldn't create job", error);
@@ -195,13 +197,15 @@ export function createStore(workspaceId: string, connectionId: string, db: Supab
     return (data.executed_at as string | null) ?? (data.decided_at as string | null) ?? (data.proposed_at as string);
   }
 
-  /** Latest inbound message time for a job's conversation(s), to tell whether anything new arrived. */
-  async function latestInboundAt(conversationId: string): Promise<string | null> {
+  /** Latest inbound message time across the given conversations, to tell whether anything new arrived. */
+  async function latestInboundAt(conversationIds: string | string[]): Promise<string | null> {
+    const ids = Array.isArray(conversationIds) ? conversationIds : [conversationIds];
+    if (ids.length === 0) return null;
     const { data, error } = await db
       .from("messages")
       .select("sent_at")
       .eq("workspace_id", ws)
-      .eq("conversation_id", conversationId)
+      .in("conversation_id", ids)
       .eq("direction", "inbound")
       .order("sent_at", { ascending: false })
       .limit(1)
@@ -239,7 +243,7 @@ export function createStore(workspaceId: string, connectionId: string, db: Supab
         labelled: true, // the CRM note the approver saves is headed "(drafted by Agrippa)"
         status: "proposed",
         payload,
-        source: { job_id: payload.job_id, crm_deal_id: payload.crm.deal_id, sweep_id: source.sweep_id },
+        source: { job_id: payload.job_id, crm_deal_id: payload.crm?.deal_id ?? null, sweep_id: source.sweep_id },
       })
       .select("id")
       .single();
@@ -247,13 +251,15 @@ export function createStore(workspaceId: string, connectionId: string, db: Supab
     return data.id as string;
   }
 
-  /** Thread for the brain: every stored message in the conversation, oldest first. */
-  async function loadThread(conversationId: string): Promise<MessageInput[]> {
+  /** Thread for the brain: every stored message in the conversation(s), oldest first. */
+  async function loadThread(conversationIds: string | string[]): Promise<MessageInput[]> {
+    const ids = Array.isArray(conversationIds) ? conversationIds : [conversationIds];
+    if (ids.length === 0) return [];
     const { data, error } = await db
       .from("messages")
       .select("source_external_id, direction, channel, author, body, sent_at")
       .eq("workspace_id", ws)
-      .eq("conversation_id", conversationId)
+      .in("conversation_id", ids)
       .order("sent_at", { ascending: true });
     if (error) fail("Couldn't load the thread", error);
     return (data ?? []).map((r) => ({

@@ -223,6 +223,49 @@ export class PipedriveClient {
     return { id: p.id, name: p.name, email: emails[0] ?? null, phone: phones[0] ?? null, emails, phones, add_time: p.add_time };
   }
 
+  /**
+   * People whose phone contains the digits (v2 search, `fields=phone`). Callers
+   * pass the national significant number so stored formats don't matter.
+   */
+  async searchPersonsByPhone(digits: string): Promise<PipedrivePerson[]> {
+    type Item = { item: { id: number; name: string; phones?: string[]; emails?: string[] } };
+    const r = await this.request<{ items: Item[] } | null>("GET", "/api/v2/persons/search", { term: digits, fields: "phone", limit: 20 });
+    return (r.data?.items ?? []).map(({ item }) => ({
+      id: item.id,
+      name: item.name,
+      email: item.emails?.[0] ?? null,
+      phone: item.phones?.[0] ?? null,
+      emails: item.emails ?? [],
+      phones: item.phones ?? [],
+      add_time: "",
+    }));
+  }
+
+  /** Every non-deleted deal of a person (open, won, lost), newest update first. */
+  async listDealsForPerson(personId: number): Promise<PipedriveDeal[]> {
+    type Raw = Omit<PipedriveDeal, "person_id"> & { person_id: number | { value: number } | null };
+    const rows = await this.listAllV1<Raw>(`/api/v1/persons/${personId}/deals`, { status: "all_not_deleted" }, 100);
+    return rows
+      .map((d) => ({
+        id: d.id,
+        title: d.title,
+        status: d.status,
+        stage_id: d.stage_id,
+        pipeline_id: d.pipeline_id,
+        person_id: typeof d.person_id === "object" && d.person_id ? d.person_id.value : (d.person_id as number | null),
+        add_time: d.add_time,
+        update_time: d.update_time,
+        last_activity_date: d.last_activity_date ?? null,
+      }))
+      .sort((a, b) => pipedriveTime(b.update_time).getTime() - pipedriveTime(a.update_time).getTime());
+  }
+
+  /** Stage id → name across all pipelines (for context on deals outside the configured mapping). */
+  async listStages(): Promise<Map<number, { name: string; pipeline_id: number }>> {
+    const r = await this.request<{ id: number; name: string; pipeline_id: number }[] | null>("GET", "/api/v1/stages");
+    return new Map((r.data ?? []).map((s) => [s.id, { name: s.name, pipeline_id: s.pipeline_id }]));
+  }
+
   /** The only write this module makes to the CRM. `text` is plain text; Pipedrive stores HTML. Returns the note id. */
   async addNote(dealId: number, text: string): Promise<number> {
     const r = await this.request<{ id: number }>("POST", "/api/v1/notes", {}, { deal_id: dealId, content: textToNoteHtml(text) });

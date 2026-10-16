@@ -11,7 +11,9 @@ import "server-only";
 import { getConnection, markConnectionError } from "@/lib/connections";
 import { audit, emitTelemetry } from "@/lib/telemetry";
 import { AcuityClient } from "./acuity";
-import { BrainError, classifyEnquiry, draftReply, sumUsage, type ThreadMessage } from "./brain";
+import { BrainError, classifyEnquiry, draftReply, sumUsage, type DraftInput, type ThreadMessage } from "./brain";
+import { ClickSendClient, type SmsRecord } from "./clicksend";
+import { maskPhone, samePhone, searchDigits, toE164 } from "./phone";
 import {
   PipedriveClient,
   noteToText,
@@ -35,6 +37,7 @@ export type SweepReport = { proposed: number; skipped: number; blocked: number; 
 const MAX_CLIENTS_PER_SWEEP = 25;
 const CONCURRENCY = 3;
 const ACTIVITY_LOOKBACK_DAYS = 30;
+const SMS_LOOKBACK_DAYS = 30;
 const NEW_DEAL_HOURS = 24;
 const TELEMETRY_MODULE = { id: MODULE_ID, version: MODULE_VERSION };
 
@@ -52,13 +55,28 @@ export async function loadSettings(workspaceId: string): Promise<{ enabled: bool
 // ---------------------------------------------------------------------------
 
 type Candidate = {
-  deal: PipedriveDeal;
-  person: PipedrivePerson;
+  /** For error reports only: "deal 123" or "text thread 4". Never a number or a name. */
+  key: string;
   bucket: Bucket;
-  sms: PipedriveActivity[];
-  notes: PipedriveNote[];
+  /** Null for a text from a number the CRM doesn't know. */
+  person: PipedrivePerson | null;
+  /** The client's number in E.164 when the thread runs over ClickSend. */
+  phone: string | null;
+  /** Null for a text thread with no deal on file. */
+  deal: PipedriveDeal | null;
+  /** The configured stage mapping, if the deal's stage is mapped. */
   stage: CrmStage | null;
+  /** Stage name from the CRM, for deals outside the mapping (won/lost, other pipelines). */
+  stageName: string | null;
+  notes: PipedriveNote[];
+  /** Pipedrive SMS activities: fallback only, when ClickSend isn't connected. */
+  sms: PipedriveActivity[];
+  /** ClickSend texts with this client, oldest first. */
+  texts: SmsRecord[];
 };
+
+/** Texts grouped by the client's number. */
+type TextThread = { phone: string; texts: SmsRecord[]; unreplied: boolean };
 
 export async function runSweep(workspaceId: string, opts: { trigger: "manual" | "cron"; actorUser?: string } = { trigger: "manual" }): Promise<SweepReport> {
   const started = Date.now();
@@ -72,37 +90,56 @@ export async function runSweep(workspaceId: string, opts: { trigger: "manual" | 
 
   const pipedriveConn = await getConnection(workspaceId, "pipedrive");
   if (!pipedriveConn) throw new Error("Pipedrive isn't connected for this workspace.");
+  // ClickSend is required: Pipedrive only tracks deals, so texts from clients whose
+  // deal is won, booked or lost would otherwise be missed.
+  const clicksendConn = await getConnection(workspaceId, "clicksend");
+  if (!clicksendConn) throw new Error("ClickSend isn't connected for this workspace. Texts can't be read without it.");
   const acuityConn = await getConnection(workspaceId, "acuity");
 
   const crm = new PipedriveClient(pipedriveConn.secrets);
+  const texts = new ClickSendClient(clicksendConn.secrets);
   const acuity = acuityConn ? new AcuityClient(acuityConn.secrets) : null;
-  const store = createStore(workspaceId, pipedriveConn.id);
+  const crmStore = createStore(workspaceId, pipedriveConn.id);
+  const smsStore = createStore(workspaceId, clicksendConn.id);
   const nowIso = new Date(started).toISOString();
 
-  // 1. Pull the pipeline and recent activity.
+  // 1. Pull the pipeline, and every text in and out. Pipedrive SMS activities are
+  // only read when ClickSend isn't the source (kept as a fallback path).
   let deals: PipedriveDeal[];
-  let activities: PipedriveActivity[];
+  let activities: PipedriveActivity[] = [];
+  let records: SmsRecord[];
   try {
-    const since = new Date(started - ACTIVITY_LOOKBACK_DAYS * 86_400_000).toISOString();
-    [deals, activities] = await Promise.all([crm.listOpenDeals(settings.crm.pipeline_id), crm.listRecentActivities(300, since)]);
+    const sinceUnix = Math.floor((started - SMS_LOOKBACK_DAYS * 86_400_000) / 1000);
+    const [d, inbound, sent] = await Promise.all([crm.listOpenDeals(settings.crm.pipeline_id), texts.listInbound(sinceUnix), texts.listSent(sinceUnix)]);
+    deals = d;
+    records = [...inbound, ...sent];
   } catch (e) {
     if (e instanceof Error && /rejected the API token/.test(e.message)) await markConnectionError(workspaceId, pipedriveConn.id);
+    if (e instanceof Error && /rejected the username/.test(e.message)) await markConnectionError(workspaceId, clicksendConn.id);
     throw e;
   }
+  void ACTIVITY_LOOKBACK_DAYS; // used by the fallback path below when activities are read instead of ClickSend
+  if (activities.length === 0 && records.length === 0 && !clicksendConn) {
+    const since = new Date(started - ACTIVITY_LOOKBACK_DAYS * 86_400_000).toISOString();
+    activities = await crm.listRecentActivities(300, since);
+  }
 
-  // 2. Decide who is waiting on us.
-  const shortlist = await shortlistDeals(crm, settings, deals, activities, nowIso, report);
+  // 2. Decide who is waiting on us: deals first, then every text thread the CRM
+  // doesn't surface (won, lost, booked, or no deal at all).
+  const dealCandidates = await shortlistDeals(crm, settings, deals, activities, nowIso, report);
+  const threads = groupTexts(records);
+  const shortlist = await mergeTextThreads(crm, settings, dealCandidates, threads, report);
   const slotFinder = createSlotFinder(acuity, settings, nowIso);
 
   // 3. Sync, route, draft, propose: a few at a time.
   await runLimited(shortlist.slice(0, MAX_CLIENTS_PER_SWEEP), CONCURRENCY, async (c) => {
     try {
-      const outcome = await processCandidate({ workspaceId, settings, crm, store, slotFinder, candidate: c, sweepId, nowIso });
+      const outcome = await processCandidate({ workspaceId, settings, crm, crmStore, smsStore, slotFinder, candidate: c, sweepId, nowIso });
       report[outcome] += 1;
     } catch (e) {
       // Per-client failures never kill the batch. BrainError messages are ours (no content); others are library text.
       const why = e instanceof BrainError ? e.message : e instanceof Error ? e.message : "failed";
-      report.errors.push(`deal ${c.deal.id}: ${why}`);
+      report.errors.push(`${c.key}: ${why}`);
     }
   });
   if (shortlist.length > MAX_CLIENTS_PER_SWEEP) report.skipped += shortlist.length - MAX_CLIENTS_PER_SWEEP;
@@ -111,7 +148,7 @@ export async function runSweep(workspaceId: string, opts: { trigger: "manual" | 
   await emitTelemetry(
     workspaceId,
     "messaging.sweep",
-    { trigger: opts.trigger, proposed: report.proposed, skipped: report.skipped, blocked: report.blocked, errors: report.errors.length, duration_ms: report.durationMs, deals_open: deals.length },
+    { trigger: opts.trigger, proposed: report.proposed, skipped: report.skipped, blocked: report.blocked, errors: report.errors.length, duration_ms: report.durationMs, deals_open: deals.length, text_threads: threads.length },
     TELEMETRY_MODULE,
   );
   await audit(workspaceId, "messaging.sweep", {
@@ -207,19 +244,20 @@ async function shortlistDeals(
       return;
     }
     const notes = (await crm.getDealNotes(p.deal.id)).filter((n) => !DRAFT_NOTE_RE.test(noteToText(n.content)));
-    out.push({ ...p, person, notes });
+    out.push({ ...p, key: `deal ${p.deal.id}`, person, phone: toE164(person.phone), stageName: p.stage?.name ?? null, notes, texts: [] });
   });
 
   // Duplicate deals for the same person (chatbot + form): keep the one with the conversation.
   const byPerson = new Map<number, Candidate>();
   for (const c of out) {
-    const current = byPerson.get(c.person.id);
+    const pid = c.person!.id;
+    const current = byPerson.get(pid);
     if (!current) {
-      byPerson.set(c.person.id, c);
+      byPerson.set(pid, c);
       continue;
     }
     const better = score(c) > score(current) ? c : current;
-    byPerson.set(c.person.id, better);
+    byPerson.set(pid, better);
     report.skipped += 1;
   }
   const result = [...byPerson.values()];
@@ -239,6 +277,110 @@ function activityTime(a: PipedriveActivity): Date {
 }
 
 // ---------------------------------------------------------------------------
+// Text threads from ClickSend: one per client number, whatever the deal state
+// ---------------------------------------------------------------------------
+
+/** Group texts by the client's number (inbound: from; outbound: to), dedupe by message id, oldest first. */
+export function groupTexts(records: SmsRecord[]): TextThread[] {
+  const seen = new Set<string>();
+  const byPhone = new Map<string, SmsRecord[]>();
+  for (const r of records) {
+    if (seen.has(r.id)) continue;
+    seen.add(r.id);
+    const phone = toE164(r.direction === "inbound" ? r.from : r.to);
+    if (!phone || !r.body.trim()) continue;
+    const list = byPhone.get(phone) ?? [];
+    list.push(r);
+    byPhone.set(phone, list);
+  }
+  const out: TextThread[] = [];
+  for (const [phone, list] of byPhone) {
+    list.sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
+    out.push({ phone, texts: list, unreplied: list[list.length - 1].direction === "inbound" });
+  }
+  return out;
+}
+
+/**
+ * Attach each thread to its deal candidate when the number matches, and make a
+ * new candidate for every unreplied thread the deal sweep didn't surface. An
+ * unreplied text is urgent regardless of deal status (won, lost, booked, none).
+ */
+async function mergeTextThreads(
+  crm: PipedriveClient,
+  settings: MessagingSettings,
+  dealCandidates: Candidate[],
+  threads: TextThread[],
+  report: SweepReport,
+): Promise<Candidate[]> {
+  const skipNames = new Set(settings.crm.skip_contact_names.map((n) => n.trim().toLowerCase()));
+  const matched = new Set<string>();
+
+  // Threads with a shortlisted deal: give the deal the text history; an unreplied text wins the bucket.
+  for (const c of dealCandidates) {
+    const t = threads.find((th) => c.person?.phones.some((p) => samePhone(p, th.phone)));
+    if (!t) continue;
+    matched.add(t.phone);
+    c.texts = t.texts;
+    c.phone = t.phone;
+    if (t.unreplied) c.bucket = "unreplied";
+  }
+
+  // Unreplied threads with no shortlisted deal: look the number up and draft anyway.
+  const extra: Candidate[] = [];
+  const unmatched = threads.filter((t) => t.unreplied && !matched.has(t.phone));
+  let stages: Map<number, { name: string; pipeline_id: number }> | null = null;
+  const stageById = new Map(settings.crm.stages.map((s) => [s.id, s]));
+  await runLimited(unmatched, CONCURRENCY, async (t) => {
+    const index = unmatched.indexOf(t) + 1;
+    const key = `text thread ${index}`;
+    const person = await findPersonByPhone(crm, t.phone);
+    if (person && skipNames.has(person.name.trim().toLowerCase())) {
+      report.skipped += 1;
+      return;
+    }
+    let deal: PipedriveDeal | null = null;
+    let notes: PipedriveNote[] = [];
+    if (person) {
+      deal = pickRelevantDeal(await crm.listDealsForPerson(person.id), settings.crm.pipeline_id);
+      if (deal) notes = (await crm.getDealNotes(deal.id)).filter((n) => !DRAFT_NOTE_RE.test(noteToText(n.content)));
+    }
+    const stage = deal ? (stageById.get(deal.stage_id) ?? null) : null;
+    let stageName = stage?.name ?? null;
+    if (deal && !stageName) {
+      stages ??= await crm.listStages();
+      stageName = stages.get(deal.stage_id)?.name ?? null;
+    }
+    extra.push({ key, bucket: "unreplied", person, phone: t.phone, deal, stage, stageName, notes, sms: [], texts: t.texts });
+  });
+
+  const order: Record<Bucket, number> = { unreplied: 0, new: 1, quiet: 2 };
+  return [...dealCandidates, ...extra].sort((a, b) => order[a.bucket] - order[b.bucket]);
+}
+
+const personByPhone = new Map<string, Promise<PipedrivePerson | null>>();
+
+/** CRM person for a number, cached per process. Search by the national digits, then confirm with a strict compare. */
+function findPersonByPhone(crm: PipedriveClient, phone: string): Promise<PipedrivePerson | null> {
+  let p = personByPhone.get(phone);
+  if (!p) {
+    p = crm
+      .searchPersonsByPhone(searchDigits(phone))
+      .then((people) => people.find((x) => x.phones.some((n) => samePhone(n, phone))) ?? null)
+      .catch(() => null);
+    personByPhone.set(phone, p);
+    setTimeout(() => personByPhone.delete(phone), 10 * 60_000).unref?.();
+  }
+  return p;
+}
+
+/** The deal that best explains who this client is: open in our pipeline, then any open, then the most recently updated. */
+export function pickRelevantDeal(deals: PipedriveDeal[], pipelineId: number): PipedriveDeal | null {
+  const open = deals.filter((d) => d.status === "open");
+  return open.find((d) => d.pipeline_id === pipelineId) ?? open[0] ?? deals.find((d) => d.status === "won" || d.status === "lost") ?? null;
+}
+
+// ---------------------------------------------------------------------------
 // One client: sync → classify → route → draft → propose
 // ---------------------------------------------------------------------------
 
@@ -246,7 +388,10 @@ type ProcessArgs = {
   workspaceId: string;
   settings: MessagingSettings;
   crm: PipedriveClient;
-  store: Store;
+  /** Rows keyed by Pipedrive ids. */
+  crmStore: Store;
+  /** Rows keyed by ClickSend ids / phone numbers. */
+  smsStore: Store;
   slotFinder: SlotFinder;
   candidate: Candidate;
   sweepId: string;
@@ -254,51 +399,85 @@ type ProcessArgs = {
 };
 
 async function processCandidate(args: ProcessArgs): Promise<"proposed" | "skipped" | "blocked"> {
-  const { workspaceId, settings, crm, store, candidate, sweepId, nowIso } = args;
-  const { deal, person, bucket, sms, notes, stage } = candidate;
+  const { workspaceId, settings, crm, crmStore, smsStore, candidate, sweepId, nowIso } = args;
+  const { deal, person, phone, bucket, sms, notes, stage, texts } = candidate;
   const t0 = Date.now();
+  const clientName = person?.name ?? `Unknown (${phone ?? "no number"})`;
+  const booked = deal !== null && (deal.status === "won" || stage?.treat_as === "booked");
 
-  // Sync core types.
-  const personId = await store.upsertPerson({ external_id: String(person.id), name: person.name, email: person.email, phone: person.phone });
-  const jobId = await store.upsertJob({
-    external_id: String(deal.id),
-    title: deal.title,
-    status: jobStatus(stage),
-    client_person_id: personId,
-    // Module data lives under its own key; the rest of `custom` is the company's field space.
-    custom: { messaging: { pipedrive_stage_id: deal.stage_id, stage_name: stage?.name ?? null, pipedrive_url: crm.dealUrl(deal.id) } },
-  });
-  const chatbotRe = new RegExp(settings.crm.chatbot_note_pattern, "i");
-  const subtype = sms.length > 0 ? "sms" : notes.some((n) => chatbotRe.test(noteToText(n.content).slice(0, 200))) ? "chatbot" : "form";
-  const conversationId = await store.upsertConversation({
-    external_id: `deal:${deal.id}`,
-    job_id: jobId,
-    subtype,
-    occurred_at: pipedriveTime(deal.add_time).toISOString(),
-    title: deal.title,
-  });
-  const newMessages = await store.addMessages(conversationId, [...notesAsMessages(notes), ...smsAsMessages(sms, settings.crm)]);
-  const latestInbound = await store.latestInboundAt(conversationId);
+  // Sync core types. People and deals are keyed by Pipedrive ids; a number the
+  // CRM doesn't know gets a person and a job keyed by the number instead.
+  const personId = person
+    ? await crmStore.upsertPerson({ external_id: String(person.id), name: person.name, email: person.email, phone: person.phone ?? phone })
+    : await smsStore.upsertPerson({ external_id: `phone:${phone}`, name: clientName, email: null, phone });
+  const jobId = deal
+    ? await crmStore.upsertJob({
+        external_id: String(deal.id),
+        title: deal.title,
+        status: deal.status === "open" ? jobStatus(stage) : deal.status,
+        client_person_id: personId,
+        // Module data lives under its own key; the rest of `custom` is the company's field space.
+        custom: { messaging: { pipedrive_stage_id: deal.stage_id, stage_name: candidate.stageName, deal_status: deal.status, pipedrive_url: crm.dealUrl(deal.id) } },
+      })
+    : await smsStore.upsertJob({
+        external_id: `sms:${phone}`,
+        subtype: "sms_only",
+        title: `Texts from ${clientName}`,
+        status: "open",
+        client_person_id: personId,
+        custom: { messaging: { phone } },
+      });
+
+  const conversationIds: string[] = [];
+  let newMessages = 0;
+  if (deal) {
+    const chatbotRe = new RegExp(settings.crm.chatbot_note_pattern, "i");
+    const subtype = sms.length > 0 ? "sms" : notes.some((n) => chatbotRe.test(noteToText(n.content).slice(0, 200))) ? "chatbot" : "form";
+    const dealConversation = await crmStore.upsertConversation({
+      external_id: `deal:${deal.id}`,
+      job_id: jobId,
+      subtype,
+      occurred_at: pipedriveTime(deal.add_time).toISOString(),
+      title: deal.title,
+    });
+    conversationIds.push(dealConversation);
+    newMessages += await crmStore.addMessages(dealConversation, [...notesAsMessages(notes), ...smsAsMessages(sms, settings.crm)]);
+  }
+  if (texts.length > 0 && phone) {
+    // One SMS thread per person, whatever deals come and go.
+    const smsConversation = await smsStore.upsertConversation({
+      external_id: `sms:${phone}`,
+      job_id: jobId,
+      subtype: "sms",
+      occurred_at: texts[0].at,
+      title: `Texts with ${clientName}`,
+    });
+    conversationIds.push(smsConversation);
+    newMessages += await smsStore.addMessages(smsConversation, textsAsMessages(texts, person?.name ?? null));
+  }
+  const latestInbound = await crmStore.latestInboundAt(conversationIds);
   const inboundAfter = (iso: string) => (latestInbound ? new Date(latestInbound).getTime() > new Date(iso).getTime() : false);
 
   // An approved draft the approver hasn't finished with (e.g. CRM save failed): leave it, never add a second.
-  const open = await store.openDraft(jobId);
+  const open = await crmStore.openDraft(jobId);
   if (open?.status === "approved") return "skipped";
   // A proposed draft stays unless something new came in since.
   if (open && newMessages === 0 && !inboundAfter(open.proposed_at)) return "skipped";
   // The last draft was dealt with: only draft again once the client has written back.
-  const decidedAt = open ? null : await store.lastDecidedAt(jobId);
+  const decidedAt = open ? null : await crmStore.lastDecidedAt(jobId);
   if (decidedAt && !inboundAfter(decidedAt)) return "skipped";
 
   // Classify.
-  const thread = await store.loadThread(conversationId);
+  const thread = await crmStore.loadThread(conversationIds);
   const brainThread: ThreadMessage[] = thread.map((m) => ({ direction: m.direction, channel: m.channel, author: m.author, body: m.body, sent_at: m.sent_at }));
   const { classification, usage: classifyUsage } = await classifyEnquiry(settings, brainThread);
   if (classification.courtesy_only && bucket !== "new") return "skipped";
 
   // Route and pick dates (code, not the model).
   const style = settings.styles.find((s) => s.name === classification.style) ?? null;
-  const needsDates = !classification.not_ready && !classification.two_people && !style?.consult_only && (classification.has_reference || !!classification.named_artist);
+  // A booked client gets no fresh dates unless they ask (the brain is told the same).
+  const needsDates =
+    !booked && !classification.not_ready && !classification.two_people && !style?.consult_only && (classification.has_reference || !!classification.named_artist);
   const artists = eligibleArtists(settings, style?.name ?? null, { namedArtist: classification.named_artist });
   let slots: OfferedSlot[] = [];
   if (needsDates && artists.length > 0) {
@@ -307,8 +486,9 @@ async function processCandidate(args: ProcessArgs): Promise<"proposed" | "skippe
   }
 
   // Draft, with hard rules inside.
-  const channelHint: "sms" | "email" = sms.length > 0 ? "sms" : "email";
-  const result = await draftReply(workspaceId, { settings, thread: brainThread, classification, bucket, slots, channelHint, nowIso });
+  const channelHint: "sms" | "email" = texts.length > 0 || sms.length > 0 ? "sms" : "email";
+  const crmContext: DraftInput["crmContext"] = deal ? { title: deal.title, status: deal.status === "deleted" ? "lost" : deal.status, stage_name: candidate.stageName, treat_as: stage?.treat_as ?? null } : null;
+  const result = await draftReply(workspaceId, { settings, thread: brainThread, classification, bucket, slots, channelHint, nowIso, crmContext });
   const cost = sumUsage([classifyUsage, ...result.usage]);
   const latency = Date.now() - t0;
 
@@ -319,11 +499,17 @@ async function processCandidate(args: ProcessArgs): Promise<"proposed" | "skippe
   }
 
   const lastInboundMsg = [...brainThread].reverse().find((m) => m.direction === "inbound");
+  const extraFlags: string[] = [];
+  if (!person) extraFlags.push(`Unknown number: no Pipedrive person has this phone (${maskPhone(phone ?? "")}). Check who it is; the note can't be saved to a deal.`);
+  else if (!deal) extraFlags.push("This person has no deal in Pipedrive, so the note can't be saved to a deal.");
+  else if (booked) extraFlags.push(`Already booked (deal "${deal.title}"${candidate.stageName ? `, ${candidate.stageName}` : ""}): check the draft answers what they asked and doesn't re-quote.`);
+  const contactEmail = person?.email ?? null;
+  const contactPhone = phone ?? toE164(person?.phone) ?? person?.phone ?? null;
   const payload: DraftPayload = {
     job_id: jobId,
     person_id: personId,
-    conversation_id: conversationId,
-    client_name: person.name,
+    conversation_id: conversationIds[conversationIds.length - 1] ?? null,
+    client_name: clientName,
     bucket,
     waiting_for: result.draft.waiting_for || classification.summary,
     channel: result.draft.channel,
@@ -335,14 +521,21 @@ async function processCandidate(args: ProcessArgs): Promise<"proposed" | "skippe
     price_confidence: result.draft.price_confidence,
     slots,
     rationale: result.draft.rationale,
-    flags: [...result.draft.flags, ...slotFlags(artists, slots, needsDates, args.slotFinder.hasAvailability)],
+    flags: [...result.draft.flags, ...extraFlags, ...slotFlags(artists, slots, needsDates, args.slotFinder.hasAvailability)],
     enquiry_excerpt: (lastInboundMsg?.body ?? classification.summary).slice(0, 280),
-    contact: { email: person.email, phone: person.phone, preferred: sms.length > 0 ? "sms" : person.email ? "email" : person.phone ? "sms" : null },
-    crm: { provider: "pipedrive", deal_id: deal.id, url: crm.dealUrl(deal.id) },
+    contact: { email: contactEmail, phone: contactPhone, preferred: channelHint === "sms" ? "sms" : contactEmail ? "email" : contactPhone ? "sms" : null },
+    crm: deal
+      ? { provider: "pipedrive", deal_id: deal.id, url: crm.dealUrl(deal.id), status: deal.status === "deleted" ? "lost" : deal.status, stage_name: candidate.stageName }
+      : null,
   };
-  await store.replaceDraft(payload, { sweep_id: sweepId });
+  await crmStore.replaceDraft(payload, { sweep_id: sweepId });
 
-  await emitTelemetry(workspaceId, "messaging.draft_proposed", { bucket, channel: payload.channel, slots: slots.length, attempts: result.attempts, replaced: open ? 1 : 0 }, TELEMETRY_MODULE);
+  await emitTelemetry(
+    workspaceId,
+    "messaging.draft_proposed",
+    { bucket, channel: payload.channel, slots: slots.length, attempts: result.attempts, replaced: open ? 1 : 0, has_deal: deal ? 1 : 0, known_person: person ? 1 : 0, booked: booked ? 1 : 0 },
+    TELEMETRY_MODULE,
+  );
   await emitTelemetry(workspaceId, "messaging.latency_ms", { bucket, ms: latency, outcome: "proposed" }, TELEMETRY_MODULE);
   await emitTelemetry(workspaceId, "messaging.cost", { bucket, ...cost, outcome: "proposed" }, TELEMETRY_MODULE);
   return "proposed";
@@ -397,6 +590,18 @@ function smsAsMessages(sms: PipedriveActivity[], prefixes: SmsPrefixes): Message
     });
   }
   return out;
+}
+
+/** ClickSend texts, deduped by message id via source_external_id. */
+function textsAsMessages(texts: SmsRecord[], clientName: string | null): MessageInput[] {
+  return texts.map((t) => ({
+    external_id: `clicksend:${t.id}`,
+    direction: t.direction,
+    channel: "sms" as const,
+    author: t.direction === "inbound" ? clientName : null,
+    body: t.body.trim(),
+    sent_at: t.at,
+  }));
 }
 
 /** Deal notes hold the chatbot conversation or the form summary: the enquiry itself, so inbound. */
@@ -476,6 +681,7 @@ export async function saveDraftNoteToCrm(
   finalBody: string,
   finalSubject?: string,
 ): Promise<{ ok: true; note_id: number } | { ok: false; error: string }> {
+  if (!payload.crm) return { ok: false, error: "No Pipedrive deal for this number; copy the text instead." };
   try {
     const conn = await getConnection(workspaceId, "pipedrive");
     if (!conn) return { ok: false, error: "Pipedrive isn't connected for this workspace." };

@@ -141,7 +141,8 @@ export type DraftPayload = {
   /** Short quote from the enquiry, for context on screen. */
   enquiry_excerpt: string;
   contact: { email: string | null; phone: string | null; preferred: "sms" | "email" | null };
-  crm: { provider: "pipedrive"; deal_id: number; url: string | null };
+  /** Null when the text came from a number with no CRM deal (nothing to save the note to). */
+  crm: { provider: "pipedrive"; deal_id: number; url: string | null; status?: "open" | "won" | "lost"; stage_name?: string | null } | null;
 };
 
 /** actions.edited_payload when a person changes a draft before approving. */
