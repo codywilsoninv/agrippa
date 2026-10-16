@@ -71,6 +71,24 @@ export async function approveDraft(_prev: DecisionState, formData: FormData): Pr
   const attempts = (draft.result?.attempts ?? 0) + 1;
   const size = editSize(payload.body.trim(), body);
 
+  // No Pipedrive deal (e.g. a text from an unknown number): nothing to write to
+  // the CRM. Approval means "I'll send this myself", so the draft is done.
+  if (!payload.crm) {
+    await supabase
+      .from("actions")
+      .update({ status: "executed", executed_at: new Date().toISOString(), result: { copied: true, attempts } })
+      .eq("workspace_id", workspace.id)
+      .eq("id", draft.id);
+    await emitTelemetry(
+      workspace.id,
+      "messaging.draft_approved",
+      { edited, edit_size: size, bucket: payload.bucket, channel: payload.channel, retry, crm: false },
+      MODULE,
+    );
+    if (edited) await emitTelemetry(workspace.id, "messaging.draft_edited", { edit_size: size }, MODULE);
+    redirect("/messaging?done=copied");
+  }
+
   const saved = await saveDraftNoteToCrm(workspace.id, payload, body, subject);
   if (!saved.ok) {
     await supabase
@@ -112,7 +130,7 @@ export async function approveDraft(_prev: DecisionState, formData: FormData): Pr
     reversibility: "external_reversible",
     labelled: true,
     status: "executed",
-    payload: { deal_id: payload.crm.deal_id, note_id: saved.note_id },
+    payload: { deal_id: payload.crm?.deal_id ?? null, note_id: saved.note_id },
     source: { draft_action_id: draft.id, job_id: payload.job_id },
     decided_by: userId,
     decided_at: decidedAt,

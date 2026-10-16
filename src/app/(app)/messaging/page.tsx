@@ -76,6 +76,7 @@ export default async function MessagingPage({ searchParams }: { searchParams: Se
           </span>
         </div>
         {done === "approved" ? <Notice>Saved to Pipedrive.</Notice> : null}
+        {done === "copied" ? <Notice>Approved. Copy the text and send it from ClickSend.</Notice> : null}
         {done === "denied" ? <Notice>Draft denied.</Notice> : null}
         {drafts.length > 0 ? (
           <DraftList drafts={drafts} selectedId={selected?.id ?? null} />

@@ -9,6 +9,8 @@ type Props = {
   initialSubject: string;
   initialBody: string;
   previousError: string | null;
+  /** False when there is no Pipedrive deal to save the note to. */
+  hasDeal: boolean;
   approveAction: (prev: DecisionState, formData: FormData) => Promise<DecisionState>;
   denyAction: (formData: FormData) => void | Promise<void>;
 };
@@ -20,6 +22,7 @@ export function DraftEditor({
   initialSubject,
   initialBody,
   previousError,
+  hasDeal,
   approveAction,
   denyAction,
 }: Props) {
@@ -95,7 +98,7 @@ export function DraftEditor({
 
         <div className="flex flex-wrap gap-2.5">
           <button type="submit" disabled={pending} className="btn-primary disabled:opacity-60">
-            {pending ? "Saving…" : "Approve and save to Pipedrive"}
+            {pending ? "Saving…" : hasDeal ? "Approve and save to Pipedrive" : "Approve (I'll copy and send it)"}
           </button>
           <button type="button" onClick={copy} className="btn-secondary">
             {copied === "done" ? "Copied" : copied === "failed" ? "Couldn't copy" : "Copy"}

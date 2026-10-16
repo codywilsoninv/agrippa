@@ -63,6 +63,7 @@ export function DraftDetail({ draft, thread, timezone, approveAction, denyAction
           <span className="text-xs text-muted">{draft.status === "approved" ? "Approved, save failed" : "Needs your approval"}</span>
         </div>
         <DraftEditor
+          hasDeal={p.crm !== null}
           key={draft.id}
           actionId={draft.id}
           channel={p.channel}
@@ -89,11 +90,24 @@ export function DraftDetail({ draft, thread, timezone, approveAction, denyAction
             Offered: {p.slots.map((s) => `${s.artist} ${new Date(s.starts_at).toLocaleString("en-AU", { timeZone: timezone, weekday: "short", day: "numeric", month: "short", hour: "numeric", minute: "2-digit" })}`).join("; ")}
           </p>
         ) : null}
-        {p.crm.url ? (
-          <a href={p.crm.url} target="_blank" rel="noreferrer" className="self-start">
-            Open the deal in Pipedrive
-          </a>
-        ) : null}
+        {p.crm ? (
+          <p className="m-0 leading-relaxed">
+            {p.crm.status === "won" ? "Deal won" : p.crm.status === "lost" ? "Deal lost" : "Open deal"}
+            {p.crm.stage_name ? ` · ${p.crm.stage_name}` : ""}
+            {p.crm.url ? (
+              <>
+                {" · "}
+                <a href={p.crm.url} target="_blank" rel="noreferrer">
+                  Open the deal in Pipedrive
+                </a>
+              </>
+            ) : null}
+          </p>
+        ) : (
+          <p className="m-0 leading-relaxed">
+            No Pipedrive deal for this number. Approving marks it done; copy the text and send it from ClickSend.
+          </p>
+        )}
       </section>
 
       <ThreadHistory messages={thread} timezone={timezone} />
