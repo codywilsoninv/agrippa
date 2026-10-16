@@ -14,6 +14,7 @@ import { AcuityClient } from "./acuity";
 import { BrainError, classifyEnquiry, draftReply, sumUsage, type DraftInput, type ThreadMessage } from "./brain";
 import { ClickSendClient, type SmsRecord } from "./clicksend";
 import { maskPhone, samePhone, searchDigits, toE164 } from "./phone";
+import { groupTexts, pickRelevantDeal, type TextThread } from "./texts";
 import {
   PipedriveClient,
   noteToText,
@@ -36,7 +37,6 @@ export type SweepReport = { proposed: number; skipped: number; blocked: number; 
 
 const MAX_CLIENTS_PER_SWEEP = 25;
 const CONCURRENCY = 3;
-const ACTIVITY_LOOKBACK_DAYS = 30;
 const SMS_LOOKBACK_DAYS = 30;
 const NEW_DEAL_HOURS = 24;
 const TELEMETRY_MODULE = { id: MODULE_ID, version: MODULE_VERSION };
@@ -75,8 +75,7 @@ type Candidate = {
   texts: SmsRecord[];
 };
 
-/** Texts grouped by the client's number. */
-type TextThread = { phone: string; texts: SmsRecord[]; unreplied: boolean };
+
 
 export async function runSweep(workspaceId: string, opts: { trigger: "manual" | "cron"; actorUser?: string } = { trigger: "manual" }): Promise<SweepReport> {
   const started = Date.now();
@@ -103,11 +102,13 @@ export async function runSweep(workspaceId: string, opts: { trigger: "manual" | 
   const smsStore = createStore(workspaceId, clicksendConn.id);
   const nowIso = new Date(started).toISOString();
 
-  // 1. Pull the pipeline, and every text in and out. Pipedrive SMS activities are
-  // only read when ClickSend isn't the source (kept as a fallback path).
+  // 1. Pull the pipeline, and every text in and out from ClickSend. Pipedrive's
+  // own SMS activities are NOT read while ClickSend is the source (they'd be
+  // duplicates); shortlistDeals still understands them, so the fallback is a
+  // one-line change if a workspace ever runs without ClickSend.
   let deals: PipedriveDeal[];
-  let activities: PipedriveActivity[] = [];
   let records: SmsRecord[];
+  const activities: PipedriveActivity[] = [];
   try {
     const sinceUnix = Math.floor((started - SMS_LOOKBACK_DAYS * 86_400_000) / 1000);
     const [d, inbound, sent] = await Promise.all([crm.listOpenDeals(settings.crm.pipeline_id), texts.listInbound(sinceUnix), texts.listSent(sinceUnix)]);
@@ -117,11 +118,6 @@ export async function runSweep(workspaceId: string, opts: { trigger: "manual" | 
     if (e instanceof Error && /rejected the API token/.test(e.message)) await markConnectionError(workspaceId, pipedriveConn.id);
     if (e instanceof Error && /rejected the username/.test(e.message)) await markConnectionError(workspaceId, clicksendConn.id);
     throw e;
-  }
-  void ACTIVITY_LOOKBACK_DAYS; // used by the fallback path below when activities are read instead of ClickSend
-  if (activities.length === 0 && records.length === 0 && !clicksendConn) {
-    const since = new Date(started - ACTIVITY_LOOKBACK_DAYS * 86_400_000).toISOString();
-    activities = await crm.listRecentActivities(300, since);
   }
 
   // 2. Decide who is waiting on us: deals first, then every text thread the CRM
@@ -280,27 +276,6 @@ function activityTime(a: PipedriveActivity): Date {
 // Text threads from ClickSend: one per client number, whatever the deal state
 // ---------------------------------------------------------------------------
 
-/** Group texts by the client's number (inbound: from; outbound: to), dedupe by message id, oldest first. */
-export function groupTexts(records: SmsRecord[]): TextThread[] {
-  const seen = new Set<string>();
-  const byPhone = new Map<string, SmsRecord[]>();
-  for (const r of records) {
-    if (seen.has(r.id)) continue;
-    seen.add(r.id);
-    const phone = toE164(r.direction === "inbound" ? r.from : r.to);
-    if (!phone || !r.body.trim()) continue;
-    const list = byPhone.get(phone) ?? [];
-    list.push(r);
-    byPhone.set(phone, list);
-  }
-  const out: TextThread[] = [];
-  for (const [phone, list] of byPhone) {
-    list.sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
-    out.push({ phone, texts: list, unreplied: list[list.length - 1].direction === "inbound" });
-  }
-  return out;
-}
-
 /**
  * Attach each thread to its deal candidate when the number matches, and make a
  * new candidate for every unreplied thread the deal sweep didn't surface. An
@@ -372,12 +347,6 @@ function findPersonByPhone(crm: PipedriveClient, phone: string): Promise<Pipedri
     setTimeout(() => personByPhone.delete(phone), 10 * 60_000).unref?.();
   }
   return p;
-}
-
-/** The deal that best explains who this client is: open in our pipeline, then any open, then the most recently updated. */
-export function pickRelevantDeal(deals: PipedriveDeal[], pipelineId: number): PipedriveDeal | null {
-  const open = deals.filter((d) => d.status === "open");
-  return open.find((d) => d.pipeline_id === pipelineId) ?? open[0] ?? deals.find((d) => d.status === "won" || d.status === "lost") ?? null;
 }
 
 // ---------------------------------------------------------------------------

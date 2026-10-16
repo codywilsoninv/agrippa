@@ -53,7 +53,17 @@ Listed in code at `src/modules/messaging/connections.ts`; the Settings screen sh
 | Gmail | Later (v0.2) | Reading email replies and sending email. Needs Google sign-in, not built |
 
 ## 5. Intake
-Listens for Items of kind: `crm_deal_created`, `crm_activity_logged` (inbound SMS), `email_received`, `email_sent` (to learn from what was actually sent) (v0.1: only the manual sweep is built; no scheduled run).
+Listens for Items of kind: `crm_deal_created`, `sms_received` and `sms_sent` (ClickSend inbound and history; the source of truth for every text, whatever the deal's state), `email_received`, `email_sent` (to learn from what was actually sent). v0.1: only the manual sweep is built; no scheduled run.
+
+What the sweep reads today:
+
+| Source | What | Keyed by |
+|---|---|---|
+| Pipedrive deals (configured pipeline, open) | New and gone-quiet enquiries, notes (chatbot transcript, form summary) | Job per deal (`enquiry`), conversation `deal:<id>` |
+| ClickSend inbound + history (last 30 days) | Every text in and out. A thread whose last text is inbound is **unreplied**, whether the client's deal is open, won, lost, booked, or there is no deal at all | Conversation per client number `sms:<E.164>`, messages by ClickSend `message_id` |
+| Pipedrive person search (by phone) | Who the number belongs to and their most relevant deal (open in our pipeline → any open → newest won/lost), for context | Job per deal; an unknown number gets a job of subtype `sms_only` ("Texts from …") so the one-open-draft rule still holds |
+
+Pipedrive's own SMS activities are not read while ClickSend is connected (they would duplicate the texts). ClickSend is read-only in v0.1; sending is a v0.2 approve-tier, labelled action.
 
 ## 6. Brain
 | Part | Where |
