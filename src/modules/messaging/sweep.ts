@@ -10,20 +10,24 @@ import "server-only";
 import { getConnection, markConnectionError } from "@/lib/connections";
 import { audit, emitTelemetry } from "@/lib/telemetry";
 import { AcuityClient } from "./acuity";
-import { classifyEnquiry, draftReply, sumUsage, type ThreadMessage } from "./brain";
+import { BrainError, classifyEnquiry, draftReply, sumUsage, type ThreadMessage } from "./brain";
 import {
   PipedriveClient,
   noteToText,
   pipedriveTime,
   smsDirection,
+  type SmsPrefixes,
   type PipedriveActivity,
   type PipedriveDeal,
   type PipedriveNote,
   type PipedrivePerson,
 } from "./pipedrive";
 import { dayStartSlot, eligibleArtists, localParts, monthsAhead, pickSlots, rankFor, worksOn, type SlotCandidate } from "./routing";
+import { DRAFT_NOTE_RE, draftNoteHeading, mergeSettings, validateSettings } from "./settings";
 import { createStore, readModuleSettings, type MessageInput, type Store } from "./store";
-import { DEFAULT_SETTINGS, MODULE_ID, MODULE_VERSION, type Artist, type Bucket, type CrmStage, type DraftPayload, type MessagingSettings, type OfferedSlot, type Weekday } from "./types";
+
+export { mergeSettings, validateSettings, draftNoteHeading };
+import { MODULE_ID, MODULE_VERSION, type Artist, type Bucket, type CrmStage, type DraftPayload, type MessagingSettings, type OfferedSlot } from "./types";
 
 export type SweepReport = { proposed: number; skipped: number; blocked: number; errors: string[]; durationMs: number };
 
@@ -31,68 +35,15 @@ const MAX_CLIENTS_PER_SWEEP = 25;
 const CONCURRENCY = 3;
 const ACTIVITY_LOOKBACK_DAYS = 30;
 const NEW_DEAL_HOURS = 24;
-/** Our own CRM notes start with this; they are drafts, not messages, so they never enter the thread. */
-const DRAFT_NOTE_PREFIX = "DRAFT —";
-
 const TELEMETRY_MODULE = { id: MODULE_ID, version: MODULE_VERSION };
 
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
 
-/** Stored settings merged over the defaults, so a half-filled settings row still has a shape. */
 export async function loadSettings(workspaceId: string): Promise<{ enabled: boolean; settings: MessagingSettings }> {
   const row = await readModuleSettings(workspaceId);
-  const stored = (row?.settings && typeof row.settings === "object" ? row.settings : {}) as Partial<MessagingSettings>;
-  const settings: MessagingSettings = {
-    ...DEFAULT_SETTINGS,
-    ...stored,
-    crm: { ...DEFAULT_SETTINGS.crm, ...(stored.crm ?? {}) },
-    slots: { ...DEFAULT_SETTINGS.slots, ...(stored.slots ?? {}) },
-    artists: Array.isArray(stored.artists) ? stored.artists : [],
-    styles: Array.isArray(stored.styles) ? stored.styles : [],
-    banned_words: Array.isArray(stored.banned_words) ? stored.banned_words : [],
-  };
-  return { enabled: Boolean(row?.enabled), settings };
-}
-
-/** Problems that stop a sweep. Empty list = good to go. For the settings screen too. */
-export function validateSettings(s: MessagingSettings): string[] {
-  const problems: string[] = [];
-  if (!s.business_name.trim()) problems.push("Business name is empty.");
-  if (!s.sender_name.trim()) problems.push("Sender name (who signs off) is empty.");
-  if (!s.timezone.trim() || !isValidTimezone(s.timezone)) problems.push("Timezone is missing or not a valid IANA zone.");
-  if (!s.voice.trim()) problems.push("Voice is empty: the drafts would have no tone to follow.");
-  if (s.artists.length === 0) problems.push("No artists on the roster.");
-  if (!s.artists.some((a) => a.active && a.in_house)) problems.push("Nobody on the roster is both active and in-house, so no one can be offered.");
-  for (const a of s.artists) {
-    if (!a.name.trim()) problems.push("An artist has no name.");
-    if (!/^\d{1,2}:\d{2}$/.test(a.day_start ?? "")) problems.push(`${a.name || "An artist"}: day_start must be HH:MM.`);
-    if ((a.acuity_calendar_id && !a.acuity_appointment_type_id) || (!a.acuity_calendar_id && a.acuity_appointment_type_id))
-      problems.push(`${a.name}: needs both an Acuity calendar id and appointment type id, or neither.`);
-  }
-  if (s.styles.length === 0) problems.push("No styles defined, so enquiries can't be routed.");
-  const names = new Set(s.artists.map((a) => a.name.trim().toLowerCase()));
-  for (const st of s.styles) {
-    for (const key of Object.keys(st.ranks)) {
-      if (!names.has(key.trim().toLowerCase())) problems.push(`Style "${st.name}" ranks "${key}", who is not on the roster.`);
-    }
-  }
-  if (!s.crm.pipeline_id) problems.push("CRM pipeline id is missing.");
-  if (s.crm.stages.length === 0) problems.push("No CRM stages mapped: the sweep can't tell new enquiries from booked ones.");
-  if (!(s.crm.quiet_after_hours > 0)) problems.push("quiet_after_hours must be greater than 0.");
-  if (!(s.slots.offer_count > 0)) problems.push("slots.offer_count must be at least 1.");
-  if (!(s.slots.lookahead_days > 0)) problems.push("slots.lookahead_days must be at least 1.");
-  return problems;
-}
-
-function isValidTimezone(tz: string): boolean {
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone: tz });
-    return true;
-  } catch {
-    return false;
-  }
+  return { enabled: Boolean(row?.enabled), settings: mergeSettings(row?.settings) };
 }
 
 // ---------------------------------------------------------------------------
@@ -148,8 +99,9 @@ export async function runSweep(workspaceId: string, opts: { trigger: "manual" | 
       const outcome = await processCandidate({ workspaceId, settings, crm, store, slotFinder, candidate: c, sweepId, nowIso });
       report[outcome] += 1;
     } catch (e) {
-      // Error text may come from a library; keep it generic in the report, ids only.
-      report.errors.push(`deal ${c.deal.id}: ${e instanceof Error ? e.message : "failed"}`);
+      // Per-client failures never kill the batch. BrainError messages are ours (no content); others are library text.
+      const why = e instanceof BrainError ? e.message : e instanceof Error ? e.message : "failed";
+      report.errors.push(`deal ${c.deal.id}: ${why}`);
     }
   });
   if (shortlist.length > MAX_CLIENTS_PER_SWEEP) report.skipped += shortlist.length - MAX_CLIENTS_PER_SWEEP;
@@ -185,11 +137,12 @@ async function shortlistDeals(
   const now = new Date(nowIso).getTime();
   const stageById = new Map(settings.crm.stages.map((s) => [s.id, s]));
   const skipNames = new Set(settings.crm.skip_contact_names.map((n) => n.trim().toLowerCase()));
+  const prefixes: SmsPrefixes = settings.crm;
 
   // SMS activities per deal, oldest first.
   const smsByDeal = new Map<number, PipedriveActivity[]>();
   for (const a of activities) {
-    if (!a.deal_id || !smsDirection(a)) continue;
+    if (!a.deal_id || !smsDirection(a, prefixes)) continue;
     const list = smsByDeal.get(a.deal_id) ?? [];
     list.push(a);
     smsByDeal.set(a.deal_id, list);
@@ -200,20 +153,24 @@ async function shortlistDeals(
   type Pre = { deal: PipedriveDeal; bucket: Bucket; sms: PipedriveActivity[]; stage: CrmStage | null };
   const pre: Pre[] = [];
   for (const deal of deals) {
-    if (!deal.person_id) {
-      report.skipped += 1; // no contact: nobody to write to
+    if (!deal.person_id || deal.pipeline_id !== settings.crm.pipeline_id) {
+      report.skipped += 1; // no contact, or outside the configured pipeline
       continue;
     }
+    // Stage gate first: a deal in a booked/ignored/unmapped stage is never drafted, even with an unreplied text.
     const stage = stageById.get(deal.stage_id) ?? null;
     const treat = stage?.treat_as ?? "ignore";
+    if (treat === "booked" || treat === "ignore") {
+      report.skipped += 1;
+      continue;
+    }
     const sms = smsByDeal.get(deal.id) ?? [];
     const lastSms = sms[sms.length - 1];
-    const unreplied = lastSms ? smsDirection(lastSms) === "inbound" : false;
+    const unreplied = lastSms ? smsDirection(lastSms, prefixes) === "inbound" : false;
     const createdRecently = now - pipedriveTime(deal.add_time).getTime() < NEW_DEAL_HOURS * 3_600_000;
 
     let bucket: Bucket | null = null;
     if (unreplied) bucket = "unreplied";
-    else if (treat === "booked" || treat === "ignore") bucket = null;
     else if (treat === "new" || createdRecently) bucket = "new";
     else if (treat === "follow_up") {
       const lastTouch = Math.max(
@@ -248,7 +205,7 @@ async function shortlistDeals(
       report.skipped += 1;
       return;
     }
-    const notes = (await crm.getDealNotes(p.deal.id)).filter((n) => !noteToText(n.content).startsWith(DRAFT_NOTE_PREFIX));
+    const notes = (await crm.getDealNotes(p.deal.id)).filter((n) => !DRAFT_NOTE_RE.test(noteToText(n.content)));
     out.push({ ...p, person, notes });
   });
 
@@ -307,9 +264,11 @@ async function processCandidate(args: ProcessArgs): Promise<"proposed" | "skippe
     title: deal.title,
     status: jobStatus(stage),
     client_person_id: personId,
-    custom: { pipedrive_stage_id: deal.stage_id, stage_name: stage?.name ?? null, pipedrive_url: crm.dealUrl(deal.id) },
+    // Module data lives under its own key; the rest of `custom` is the company's field space.
+    custom: { messaging: { pipedrive_stage_id: deal.stage_id, stage_name: stage?.name ?? null, pipedrive_url: crm.dealUrl(deal.id) } },
   });
-  const subtype = sms.length > 0 ? "sms" : notes.some((n) => /chat|bot/i.test(noteToText(n.content).slice(0, 200))) ? "chatbot" : "form";
+  const chatbotRe = new RegExp(settings.crm.chatbot_note_pattern, "i");
+  const subtype = sms.length > 0 ? "sms" : notes.some((n) => chatbotRe.test(noteToText(n.content).slice(0, 200))) ? "chatbot" : "form";
   const conversationId = await store.upsertConversation({
     external_id: `deal:${deal.id}`,
     job_id: jobId,
@@ -317,15 +276,18 @@ async function processCandidate(args: ProcessArgs): Promise<"proposed" | "skippe
     occurred_at: pipedriveTime(deal.add_time).toISOString(),
     title: deal.title,
   });
-  const newMessages = await store.addMessages(conversationId, [...notesAsMessages(notes), ...smsAsMessages(sms)]);
+  const newMessages = await store.addMessages(conversationId, [...notesAsMessages(notes), ...smsAsMessages(sms, settings.crm)]);
+  const latestInbound = await store.latestInboundAt(conversationId);
+  const inboundAfter = (iso: string) => (latestInbound ? new Date(latestInbound).getTime() > new Date(iso).getTime() : false);
 
-  // Leave an existing open draft alone unless something new has come in.
+  // An approved draft the approver hasn't finished with (e.g. CRM save failed): leave it, never add a second.
   const open = await store.openDraft(jobId);
-  if (open) {
-    const latestInbound = await store.latestInboundAt(conversationId);
-    const newerInbound = latestInbound ? new Date(latestInbound).getTime() > new Date(open.proposed_at).getTime() : false;
-    if (newMessages === 0 && !newerInbound) return "skipped";
-  }
+  if (open?.status === "approved") return "skipped";
+  // A proposed draft stays unless something new came in since.
+  if (open && newMessages === 0 && !inboundAfter(open.proposed_at)) return "skipped";
+  // The last draft was dealt with: only draft again once the client has written back.
+  const decidedAt = open ? null : await store.lastDecidedAt(jobId);
+  if (decidedAt && !inboundAfter(decidedAt)) return "skipped";
 
   // Classify.
   const thread = await store.loadThread(conversationId);
@@ -339,7 +301,7 @@ async function processCandidate(args: ProcessArgs): Promise<"proposed" | "skippe
   const artists = eligibleArtists(settings, style?.name ?? null, { namedArtist: classification.named_artist });
   let slots: OfferedSlot[] = [];
   if (needsDates && artists.length > 0) {
-    const candidates = await args.slotFinder(artists, style?.ranks ?? {}, classification.preferred_weekdays);
+    const candidates = await args.slotFinder(artists, style?.ranks ?? {});
     slots = pickSlots(candidates, settings.slots.offer_count, classification.preferred_weekdays, settings.timezone);
   }
 
@@ -355,7 +317,7 @@ async function processCandidate(args: ProcessArgs): Promise<"proposed" | "skippe
     return "blocked";
   }
 
-  const latestInbound = [...brainThread].reverse().find((m) => m.direction === "inbound");
+  const lastInboundMsg = [...brainThread].reverse().find((m) => m.direction === "inbound");
   const payload: DraftPayload = {
     job_id: jobId,
     person_id: personId,
@@ -364,7 +326,7 @@ async function processCandidate(args: ProcessArgs): Promise<"proposed" | "skippe
     bucket,
     waiting_for: result.draft.waiting_for || classification.summary,
     channel: result.draft.channel,
-    subject: result.draft.subject,
+    subject: result.draft.channel === "email" ? settings.email_subject : undefined,
     body: result.draft.body,
     style: style?.name ?? (classification.style === "unclear" ? null : classification.style),
     artist: result.draft.artist ?? (slots[0]?.artist ?? null),
@@ -373,7 +335,7 @@ async function processCandidate(args: ProcessArgs): Promise<"proposed" | "skippe
     slots,
     rationale: result.draft.rationale,
     flags: [...result.draft.flags, ...slotFlags(artists, slots, needsDates, args.slotFinder.hasAvailability)],
-    enquiry_excerpt: (latestInbound?.body ?? classification.summary).slice(0, 280),
+    enquiry_excerpt: (lastInboundMsg?.body ?? classification.summary).slice(0, 280),
     contact: { email: person.email, phone: person.phone, preferred: sms.length > 0 ? "sms" : person.email ? "email" : person.phone ? "sms" : null },
     crm: { provider: "pipedrive", deal_id: deal.id, url: crm.dealUrl(deal.id) },
   };
@@ -415,14 +377,15 @@ function slotFlags(artists: Artist[], slots: OfferedSlot[], needsDates: boolean,
 // Messages from CRM records
 // ---------------------------------------------------------------------------
 
-function smsAsMessages(sms: PipedriveActivity[]): MessageInput[] {
+function smsAsMessages(sms: PipedriveActivity[], prefixes: SmsPrefixes): MessageInput[] {
   const out: MessageInput[] = [];
   for (const a of sms) {
-    const direction = smsDirection(a);
+    const direction = smsDirection(a, prefixes);
     if (!direction) continue;
     const body = noteToText(a.note ?? "");
     if (!body) continue;
-    const author = a.subject.replace(/^(Received SMS from|SMS Sent to)\s*/i, "").trim() || null;
+    const prefix = direction === "inbound" ? prefixes.sms_inbound_prefix : prefixes.sms_outbound_prefix;
+    const author = a.subject.trim().slice(prefix.trim().length).trim() || null;
     out.push({
       external_id: `activity:${a.id}`,
       direction,
@@ -453,15 +416,16 @@ function notesAsMessages(notes: PipedriveNote[]): MessageInput[] {
 // Availability: free day-start slots per artist, cached for the sweep
 // ---------------------------------------------------------------------------
 
-type SlotFinder = ((artists: Artist[], ranks: Record<string, number>, preferredWeekdays: Weekday[]) => Promise<SlotCandidate[]>) & { hasAvailability: boolean };
+type SlotFinder = ((artists: Artist[], ranks: Record<string, number>) => Promise<SlotCandidate[]>) & { hasAvailability: boolean };
 
 function createSlotFinder(acuity: AcuityClient | null, settings: MessagingSettings, nowIso: string): SlotFinder {
   const cache = new Map<string, Promise<string[]>>();
   const tz = settings.timezone;
   const horizon = new Date(nowIso).getTime() + settings.slots.lookahead_days * 86_400_000;
-  const want = settings.slots.offer_count + 2; // a little slack so day-level dedupe still leaves enough
+  const want = Math.max(settings.slots.offer_count * 4, 12); // enough that a weekday preference can still be met from the pool
 
-  async function freeStarts(artist: Artist, preferred: Weekday[]): Promise<string[]> {
+  /** All free day-start slots for an artist in the window. Weekday preference is applied later by pickSlots, so its fallback works. */
+  async function freeStarts(artist: Artist): Promise<string[]> {
     if (!acuity || !artist.acuity_calendar_id || !artist.acuity_appointment_type_id) return [];
     const typeId = artist.acuity_appointment_type_id;
     const calId = artist.acuity_calendar_id;
@@ -472,7 +436,6 @@ function createSlotFinder(acuity: AcuityClient | null, settings: MessagingSettin
         const dayIso = `${date}T12:00:00Z`; // midday UTC keeps the weekday stable in any zone
         const wd = localParts(dayIso, tz).weekday;
         if (!worksOn(artist, wd)) continue;
-        if (preferred.length > 0 && !preferred.includes(wd)) continue;
         if (new Date(dayIso).getTime() > horizon + 86_400_000) continue;
         const times = await acuity.availableTimes(typeId, calId, date, tz);
         const start = dayStartSlot(artist, times, tz);
@@ -483,15 +446,13 @@ function createSlotFinder(acuity: AcuityClient | null, settings: MessagingSettin
     return found;
   }
 
-  const finder = (async (artists: Artist[], ranks: Record<string, number>, preferredWeekdays: Weekday[]) => {
-    const preferred = [...preferredWeekdays].sort();
+  const finder = (async (artists: Artist[], ranks: Record<string, number>) => {
     const results = await Promise.all(
       artists.map(async (artist) => {
-        const key = `${artist.name}|${preferred.join(",")}`;
-        let p = cache.get(key);
+        let p = cache.get(artist.name);
         if (!p) {
-          p = freeStarts(artist, preferred);
-          cache.set(key, p);
+          p = freeStarts(artist);
+          cache.set(artist.name, p);
         }
         const starts = await p;
         const rank = rankFor(ranks, artist.name) ?? undefined;
@@ -517,9 +478,8 @@ export async function saveDraftNoteToCrm(
   try {
     const conn = await getConnection(workspaceId, "pipedrive");
     if (!conn) return { ok: false, error: "Pipedrive isn't connected for this workspace." };
-    const heading = payload.channel === "sms" ? "DRAFT — SMS:" : `DRAFT — EMAIL (${finalSubject ?? payload.subject ?? "Enquiry"}):`;
-    const content = `${heading}\n\n${finalBody.trim()}`;
-    const note_id = await new PipedriveClient(conn.secrets).addNote(payload.crm.deal_id, content);
+    const heading = draftNoteHeading(payload.channel, finalSubject ?? payload.subject);
+    const note_id = await new PipedriveClient(conn.secrets).addNote(payload.crm.deal_id, `${heading}\n\n${finalBody.trim()}`);
     return { ok: true, note_id };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "Couldn't save the note to Pipedrive." };

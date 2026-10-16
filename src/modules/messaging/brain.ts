@@ -59,6 +59,14 @@ export type DraftResult =
   | { ok: true; draft: DraftOutput; usage: TokenUsage[]; attempts: number }
   | { ok: false; failures: RuleFailure[]; usage: TokenUsage[]; attempts: number };
 
+/** A failure we can explain per client (no content in the message). The sweep records it and moves on. */
+export class BrainError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BrainError";
+  }
+}
+
 let instructionsCache: string | null = null;
 
 /** Read at runtime so the file is data, not a string baked into code. next.config.ts traces it into the bundle. */
@@ -105,12 +113,15 @@ function renderStyles(settings: MessagingSettings): string {
   return settings.styles.map((s) => `- ${s.name}: ${s.description}${s.consult_only ? " (consult only, no quote)" : ""}`).join("\n");
 }
 
-/** Pulls a tool_use input out of a response, or throws a readable error. */
+/** Pulls a tool_use input out of a response, or throws a readable per-client error. */
 function toolInput<T>(message: Anthropic.Message, toolName: string): T {
+  if (message.stop_reason === "max_tokens") {
+    throw new BrainError(`Model ran out of output tokens during ${toolName}; the thread may be too long`);
+  }
   for (const block of message.content) {
     if (block.type === "tool_use" && block.name === toolName) return block.input as T;
   }
-  throw new Error(`Model did not return structured output (${toolName}); stop_reason=${message.stop_reason}`);
+  throw new BrainError(`Model did not return structured output (${toolName}); stop_reason=${message.stop_reason}`);
 }
 
 function usageOf(message: Anthropic.Message): TokenUsage {
@@ -153,7 +164,7 @@ export async function classifyEnquiry(
 
   const message = await client().messages.create({
     model: MODELS.quick,
-    max_tokens: 600,
+    max_tokens: 1000,
     system,
     messages: [{ role: "user", content: user }],
     tools: [
@@ -279,7 +290,7 @@ function renderDraftRequest(input: DraftInput): string {
     `SIGNS OFF AS: ${settings.sender_name}`,
     `TIMEZONE: ${tz}. Current local time: ${formatSlot(input.nowIso, tz)}.`,
     `SITUATION: ${bucketNote[input.bucket]}`,
-    `CHANNEL: ${input.channelHint === "sms" ? "Reply by text (the thread runs over SMS)." : "Reply by email."}`,
+    `CHANNEL: ${input.channelHint === "sms" ? "Reply by text (the thread runs over SMS)." : `Reply by email. Subject line is fixed: "${settings.email_subject}".`}`,
     "",
     "VOICE (how this business writes):",
     settings.voice || "(none given)",
@@ -320,7 +331,7 @@ function draftTool(settings: MessagingSettings): Anthropic.Tool {
       type: "object",
       properties: {
         channel: { type: "string", enum: ["sms", "email"] },
-        subject: { type: ["string", "null"], description: "Email only" },
+        subject: { type: ["string", "null"], description: "Email only; use the fixed subject given" },
         body: { type: "string", description: "The complete reply, ready to send" },
         artist: { type: ["string", "null"], enum: [...artistNames, null], description: "Person offered, or null" },
         price: { type: ["string", "null"], description: "Price exactly as written in the body, or null" },
@@ -338,7 +349,7 @@ function draftTool(settings: MessagingSettings): Anthropic.Tool {
 function validateDraft(raw: Record<string, unknown>, channelHint: "sms" | "email"): DraftOutput {
   const str = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : null);
   const body = str(raw.body);
-  if (!body) throw new Error("Model returned an empty draft body");
+  if (!body) throw new BrainError("Model returned an empty draft body");
   const channel = raw.channel === "sms" || raw.channel === "email" ? raw.channel : channelHint;
   const conf = raw.price_confidence;
   return {

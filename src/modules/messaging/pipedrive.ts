@@ -2,9 +2,11 @@
 // Auth is the API token as a query parameter (Pipedrive's supported method for
 // personal tokens). The token is never logged and never included in errors.
 //
-// Inbound SMS (via the studio's SMS integration) show up as activities whose
-// subject starts "Received SMS from"; outbound as "SMS Sent to". The message
-// text sits in the activity's `note` field and `deal_id` ties it to the deal.
+// Inbound/outbound SMS (via the business's SMS integration) show up as
+// activities whose subject starts with a configurable prefix (settings.crm).
+// The message text sits in the activity's `note` field and `deal_id` ties it
+// to the deal. Lists use API v2 (cursor paging, real sort/filter support);
+// single records and the note write use v1.
 
 import type { ProviderSecrets } from "@/lib/connections";
 
@@ -17,9 +19,10 @@ export type PipedriveDeal = {
   stage_id: number;
   pipeline_id: number;
   person_id: number | null;
-  add_time: string; // "YYYY-MM-DD HH:MM:SS" UTC (v1) or ISO (v2)
+  /** ISO/RFC3339 (v2). Parse with pipedriveTime. */
+  add_time: string;
   update_time: string;
-  /** Last activity of any kind, as Pipedrive tracks it. */
+  /** Last activity of any kind, as Pipedrive tracks it (v2 may omit it). */
   last_activity_date: string | null;
 };
 
@@ -121,40 +124,77 @@ export class PipedriveClient {
     return out;
   }
 
+  /** Pages through a v2 list endpoint (cursor pagination). */
+  private async listAllV2<T>(path: string, params: Record<string, string | number | undefined>, max = 1000): Promise<T[]> {
+    const out: T[] = [];
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await this.request<T[] | null>("GET", path, { ...params, limit: Math.min(500, max), cursor });
+      out.push(...(page.data ?? []));
+      const next = page.additional_data?.next_cursor;
+      if (!next || out.length >= max) break;
+      cursor = next;
+    }
+    return out.slice(0, max);
+  }
+
   /** Verifies the token and returns the company name (or user email) for the connections screen. */
   async me(): Promise<string> {
     const r = await this.request<{ company_name?: string; email?: string; name?: string }>("GET", "/api/v1/users/me");
     return r.data.company_name || r.data.email || r.data.name || "Pipedrive";
   }
 
+  /** Open deals in one pipeline (v2 honours pipeline_id; v1 ignores it). */
   async listOpenDeals(pipelineId: number): Promise<PipedriveDeal[]> {
-    type Raw = Omit<PipedriveDeal, "person_id"> & { person_id: number | { value: number } | null };
-    const rows = await this.listAllV1<Raw>("/api/v1/deals", { status: "open", pipeline_id: pipelineId, sort: "update_time DESC" });
-    return rows.map((d) => ({
-      id: d.id,
-      title: d.title,
-      status: d.status,
-      stage_id: d.stage_id,
-      pipeline_id: d.pipeline_id,
-      person_id: typeof d.person_id === "object" && d.person_id ? d.person_id.value : (d.person_id as number | null),
-      add_time: d.add_time,
-      update_time: d.update_time,
-      last_activity_date: d.last_activity_date ?? null,
-    }));
+    type Raw = {
+      id: number;
+      title: string;
+      status: PipedriveDeal["status"];
+      stage_id: number;
+      pipeline_id: number;
+      person_id: number | null;
+      add_time: string;
+      update_time: string;
+      last_activity_date?: string | null;
+    };
+    const rows = await this.listAllV2<Raw>("/api/v2/deals", { status: "open", pipeline_id: pipelineId, sort_by: "update_time", sort_direction: "desc" });
+    return rows
+      .filter((d) => d.pipeline_id === pipelineId) // belt and braces if the filter is ignored
+      .map((d) => ({
+        id: d.id,
+        title: d.title,
+        status: d.status,
+        stage_id: d.stage_id,
+        pipeline_id: d.pipeline_id,
+        person_id: d.person_id ?? null,
+        add_time: d.add_time,
+        update_time: d.update_time,
+        last_activity_date: d.last_activity_date ?? null,
+      }));
   }
 
-  /** Most recently updated activities across the account, newest first. `since` is an ISO instant. */
-  async listRecentActivities(limit = 200, since?: string): Promise<PipedriveActivity[]> {
-    const rows = await this.listAllV1<PipedriveActivity>(
-      "/api/v1/activities",
-      { user_id: 0, done: undefined, sort: "update_time DESC" },
+  /** Activities updated since `since` (RFC3339), newest first, across all users. */
+  async listRecentActivities(limit = 500, since?: string): Promise<PipedriveActivity[]> {
+    type Raw = Partial<PipedriveActivity> & { id: number; subject?: string | null; type?: string };
+    const rows = await this.listAllV2<Raw>(
+      "/api/v2/activities",
+      { updated_since: since ? new Date(since).toISOString().replace(/\.\d{3}Z$/, "Z") : undefined, sort_by: "update_time", sort_direction: "desc" },
       limit,
     );
-    const cutoff = since ? new Date(since).getTime() : null;
-    return rows
-      .map((a) => ({ ...a, note: a.note ?? null, deal_id: a.deal_id ?? null }))
-      .filter((a) => cutoff === null || pipedriveTime(a.update_time).getTime() >= cutoff)
-      .slice(0, limit);
+    return rows.map((a) => ({
+      id: a.id,
+      subject: a.subject ?? "",
+      type: a.type ?? "",
+      note: a.note ?? null,
+      deal_id: a.deal_id ?? null,
+      person_id: a.person_id ?? null,
+      done: Boolean(a.done),
+      due_date: a.due_date ?? null,
+      due_time: a.due_time ?? null,
+      add_time: a.add_time ?? "",
+      update_time: a.update_time ?? "",
+      marked_as_done_time: a.marked_as_done_time ?? null,
+    }));
   }
 
   async getDealNotes(dealId: number): Promise<PipedriveNote[]> {
@@ -183,9 +223,9 @@ export class PipedriveClient {
     return { id: p.id, name: p.name, email: emails[0] ?? null, phone: phones[0] ?? null, emails, phones, add_time: p.add_time };
   }
 
-  /** The only write this module makes to the CRM. Returns the note id. */
-  async addNote(dealId: number, content: string): Promise<number> {
-    const r = await this.request<{ id: number }>("POST", "/api/v1/notes", {}, { deal_id: dealId, content });
+  /** The only write this module makes to the CRM. `text` is plain text; Pipedrive stores HTML. Returns the note id. */
+  async addNote(dealId: number, text: string): Promise<number> {
+    const r = await this.request<{ id: number }>("POST", "/api/v1/notes", {}, { deal_id: dealId, content: textToNoteHtml(text) });
     return r.data.id;
   }
 
@@ -201,7 +241,7 @@ function contactValues(v: { value: string; primary?: boolean }[] | string | unde
   return sorted.map((x) => (x.value ?? "").trim()).filter(Boolean);
 }
 
-/** Pipedrive v1 timestamps are "YYYY-MM-DD HH:MM:SS" in UTC with no zone marker. */
+/** v2 gives RFC3339; v1 gives "YYYY-MM-DD HH:MM:SS" in UTC with no zone marker. Both handled. */
 export function pipedriveTime(s: string | null | undefined): Date {
   if (!s) return new Date(NaN);
   if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s)) return new Date(s.replace(" ", "T") + "Z");
@@ -225,13 +265,29 @@ export function noteToText(html: string): string {
     .trim();
 }
 
-export const SMS_INBOUND_PREFIX = "Received SMS from";
-export const SMS_OUTBOUND_PREFIX = "SMS Sent to";
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
 
-export function smsDirection(activity: Pick<PipedriveActivity, "subject">): "inbound" | "outbound" | null {
-  const s = (activity.subject ?? "").trim();
-  if (s.startsWith(SMS_INBOUND_PREFIX)) return "inbound";
-  if (s.startsWith(SMS_OUTBOUND_PREFIX)) return "outbound";
+/** Plain text → the HTML Pipedrive expects in a note: one <p> per paragraph, <br> inside. */
+export function textToNoteHtml(text: string): string {
+  return text
+    .replace(/\r\n?/g, "\n")
+    .trim()
+    .split(/\n{2,}/)
+    .map((para) => `<p>${escapeHtml(para).replace(/\n/g, "<br>")}</p>`)
+    .join("");
+}
+
+export type SmsPrefixes = { sms_inbound_prefix: string; sms_outbound_prefix: string };
+
+/** Which way an SMS activity went, by its subject prefix (configured per business). */
+export function smsDirection(activity: Pick<PipedriveActivity, "subject">, prefixes: SmsPrefixes): "inbound" | "outbound" | null {
+  const s = (activity.subject ?? "").trim().toLowerCase();
+  const inb = prefixes.sms_inbound_prefix.trim().toLowerCase();
+  const out = prefixes.sms_outbound_prefix.trim().toLowerCase();
+  if (inb && s.startsWith(inb)) return "inbound";
+  if (out && s.startsWith(out)) return "outbound";
   return null;
 }
 

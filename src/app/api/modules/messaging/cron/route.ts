@@ -3,6 +3,7 @@
 // sweep for every workspace that has the module switched on, using the
 // service client because there is no signed-in user.
 
+import { timingSafeEqual } from "node:crypto";
 import { listEnabledWorkspaces } from "@/modules/messaging/store";
 import { runSweep, type SweepReport } from "@/modules/messaging/sweep";
 
@@ -12,7 +13,7 @@ export const dynamic = "force-dynamic";
 export async function GET(request: Request) {
   const secret = process.env.CRON_SECRET;
   if (!secret) return Response.json({ error: "CRON_SECRET is not set" }, { status: 500 });
-  if (request.headers.get("authorization") !== `Bearer ${secret}`) {
+  if (!bearerMatches(request.headers.get("authorization"), secret)) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -27,4 +28,11 @@ export async function GET(request: Request) {
     }
   }
   return Response.json({ ok: true, workspaces: workspaces.length, results });
+}
+
+/** Constant-time compare so the secret can't be guessed byte by byte from response timing. */
+function bearerMatches(header: string | null, secret: string): boolean {
+  const given = Buffer.from(header ?? "");
+  const wanted = Buffer.from(`Bearer ${secret}`);
+  return given.length === wanted.length && timingSafeEqual(given, wanted);
 }

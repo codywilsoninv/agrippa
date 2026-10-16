@@ -47,7 +47,7 @@ export type MessageInput = {
   sent_at: string;
 };
 
-export type OpenDraft = { id: string; proposed_at: string; payload: DraftPayload };
+export type OpenDraft = { id: string; status: "proposed" | "approved"; proposed_at: string; payload: DraftPayload };
 
 function fail(what: string, error: { message: string } | null): never {
   throw new Error(`${what}: ${error?.message ?? "unknown error"}`);
@@ -155,20 +155,44 @@ export function createStore(workspaceId: string, connectionId: string, db: Supab
     return fresh.length;
   }
 
-  /** The open (proposed) draft for a job, if any. */
+  /**
+   * The open draft for a job: proposed, or approved but not yet executed (e.g.
+   * the CRM save failed and the approver should retry, not get a second draft).
+   */
   async function openDraft(jobId: string): Promise<OpenDraft | null> {
     const { data, error } = await db
       .from("actions")
-      .select("id, proposed_at, payload")
+      .select("id, status, proposed_at, payload")
       .eq("workspace_id", ws)
       .eq("module_id", MODULE_ID)
       .eq("kind", "draft_reply")
-      .eq("status", "proposed")
+      .in("status", ["proposed", "approved"])
+      .is("executed_at", null)
       .eq("source->>job_id", jobId)
+      .order("proposed_at", { ascending: false })
+      .limit(1)
       .maybeSingle();
     if (error) fail("Couldn't read open draft", error);
     if (!data) return null;
-    return { id: data.id as string, proposed_at: data.proposed_at as string, payload: data.payload as DraftPayload };
+    return { id: data.id as string, status: data.status as OpenDraft["status"], proposed_at: data.proposed_at as string, payload: data.payload as DraftPayload };
+  }
+
+  /** When the last draft for this job was dealt with (approved/executed/denied), so we don't re-draft daily. */
+  async function lastDecidedAt(jobId: string): Promise<string | null> {
+    const { data, error } = await db
+      .from("actions")
+      .select("proposed_at, decided_at, executed_at")
+      .eq("workspace_id", ws)
+      .eq("module_id", MODULE_ID)
+      .eq("kind", "draft_reply")
+      .in("status", ["approved", "executed", "denied"])
+      .eq("source->>job_id", jobId)
+      .order("proposed_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) fail("Couldn't read decided drafts", error);
+    if (!data) return null;
+    return (data.executed_at as string | null) ?? (data.decided_at as string | null) ?? (data.proposed_at as string);
   }
 
   /** Latest inbound message time for a job's conversation(s), to tell whether anything new arrived. */
@@ -189,6 +213,7 @@ export function createStore(workspaceId: string, connectionId: string, db: Supab
   /**
    * Replace the open draft for a job. Cancels the old proposed one first (the
    * partial unique index allows only one open draft per job), then inserts.
+   * Approved-but-unexecuted drafts are not touched: the caller skips those jobs.
    */
   async function replaceDraft(payload: DraftPayload, source: { sweep_id: string }): Promise<string> {
     const { error: cancelError } = await db
@@ -211,7 +236,7 @@ export function createStore(workspaceId: string, connectionId: string, db: Supab
         target: "agrippa",
         tier: "approve",
         reversibility: "internal",
-        labelled: false, // never leaves Agrippa; the label applies when a send action is executed
+        labelled: true, // the CRM note the approver saves is headed "(drafted by Agrippa)"
         status: "proposed",
         payload,
         source: { job_id: payload.job_id, crm_deal_id: payload.crm.deal_id, sweep_id: source.sweep_id },
@@ -241,7 +266,7 @@ export function createStore(workspaceId: string, connectionId: string, db: Supab
     }));
   }
 
-  return { upsertPerson, upsertJob, upsertConversation, addMessages, openDraft, latestInboundAt, replaceDraft, loadThread };
+  return { upsertPerson, upsertJob, upsertConversation, addMessages, openDraft, lastDecidedAt, latestInboundAt, replaceDraft, loadThread };
 }
 
 /** Settings row for the module, or null when not enabled. */

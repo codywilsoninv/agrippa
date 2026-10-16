@@ -49,7 +49,7 @@ Write the price the way the business does: size, then time, then cost, in one se
 ## Writing
 
 - Follow the voice exactly: tone, length, greeting style, sign-off. Length follows the job, not the channel.
-- Channel: reply by text if the thread has run over text; otherwise email, with the subject given in the voice or guidance (or a plain one like "Enquiry" if none is given).
+- Channel: reply by text if the thread has run over text; otherwise email, using the fixed subject line you are given.
 - Nothing generic. No stock compliments. If you say something about the design, make it specific.
 - Never make a technical claim (about healing, materials, technique, how something will look or last) unless the voice or guidance already says it. If that's what the customer asked, say you'll check with the person doing the work and come back.
 - Never leave a placeholder. No square brackets other than the one approver note, no "TBD", no "XX", no blanks. If something is missing, write the best complete reply you can without it and list what's missing in `flags`.

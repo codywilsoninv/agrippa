@@ -61,14 +61,23 @@ export type MessagingSettings = {
   styles: StyleRoute[];
   /** Words that must never appear in a draft (hard rule). */
   banned_words: string[];
+  /** Subject line for email replies. */
+  email_subject: string;
   crm: {
     provider: "pipedrive";
+    /** 0 = not set (validateSettings flags it). */
     pipeline_id: number;
     stages: CrmStage[];
     /** Hours without activity before a follow-up deal counts as gone quiet. */
     quiet_after_hours: number;
     /** Deals whose contact has one of these names are skipped (e.g. staff test entries). */
     skip_contact_names: string[];
+    /** Activity subject prefix the SMS integration logs for an inbound text. */
+    sms_inbound_prefix: string;
+    /** Activity subject prefix the SMS integration logs for an outbound text. */
+    sms_outbound_prefix: string;
+    /** Regex (case-insensitive) that marks a deal note as a chatbot transcript. */
+    chatbot_note_pattern: string;
   };
   slots: {
     /** How many dates to offer. */
@@ -89,7 +98,17 @@ export const DEFAULT_SETTINGS: MessagingSettings = {
   artists: [],
   styles: [],
   banned_words: [],
-  crm: { provider: "pipedrive", pipeline_id: 1, stages: [], quiet_after_hours: 48, skip_contact_names: [] },
+  email_subject: "Enquiry",
+  crm: {
+    provider: "pipedrive",
+    pipeline_id: 0,
+    stages: [],
+    quiet_after_hours: 48,
+    skip_contact_names: [],
+    sms_inbound_prefix: "Received SMS from",
+    sms_outbound_prefix: "SMS Sent to",
+    chatbot_note_pattern: "chat|bot",
+  },
   slots: { offer_count: 3, lookahead_days: 42 },
 };
 
