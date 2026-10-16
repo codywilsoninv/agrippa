@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { PROVIDERS } from "@/lib/providers";
 import { MESSAGING_CONNECTIONS } from "@/modules/messaging/connections";
-import { isAdmin, requireWorkspace } from "@/lib/workspace";
+import { requireWorkspace } from "@/lib/workspace";
 import { listConnections } from "@/lib/connections";
 import { DraftList } from "@/components/draft-list";
 import { DraftDetail } from "@/components/draft-detail";
@@ -12,14 +12,13 @@ import { conversationIdsOf, listOpenDrafts, listThread, loadDecidedDraft, loadMo
 import { approveDraft, denyDraft, sweepNow } from "./actions";
 
 export const metadata = { title: "Messaging · Agrippa" };
-// The manual sweep runs as a server action on this page and can take minutes.
+// Refresh runs as a server action on this page and can take minutes.
 export const maxDuration = 300;
 
 type Search = Promise<{ d?: string | string[]; done?: string | string[]; a?: string | string[] }>;
 
 export default async function MessagingPage({ searchParams }: { searchParams: Search }) {
   const { workspace } = await requireWorkspace();
-  const admin = isAdmin(workspace);
   const params = await searchParams;
   const wanted = Array.isArray(params.d) ? params.d[0] : params.d;
   const done = Array.isArray(params.done) ? params.done[0] : params.done;
@@ -96,15 +95,13 @@ export default async function MessagingPage({ searchParams }: { searchParams: Se
           <div className="flex flex-col gap-3 px-6 text-muted">
             <p className="m-0">Nobody is waiting on a reply.</p>
             <p className="m-0 text-xs">
-              {sweep ? `Last sweep ${formatDateTime(sweep.at, module.settings.timezone)} (${longAge(sweep.at)} ago).` : "No sweep has run yet."}
+              {sweep ? `Last refreshed ${formatDateTime(sweep.at, module.settings.timezone)} (${longAge(sweep.at)} ago).` : "Press Refresh to check every connection for new messages."}
             </p>
           </div>
         )}
-        {admin ? (
-          <div className="mt-auto px-6 pt-4">
-            <SweepButton action={sweepNow} />
-          </div>
-        ) : null}
+        <div className="mt-auto px-6 pt-4">
+          <SweepButton action={sweepNow} lastRefreshed={sweep?.at ?? null} />
+        </div>
       </section>
 
       <main className="flex min-w-0 flex-1 flex-col gap-6 px-4 py-7 sm:px-10">
@@ -118,7 +115,7 @@ export default async function MessagingPage({ searchParams }: { searchParams: Se
           />
         ) : (
           <p className="m-0 max-w-[48ch] text-muted">
-            When the sweep finds someone waiting, their draft reply appears here for you to check and approve.
+            Press Refresh. When someone is waiting on a reply, their draft appears here for you to check and approve.
           </p>
         )}
       </main>

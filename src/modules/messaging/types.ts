@@ -82,6 +82,8 @@ export type MessagingSettings = {
     chatbot_note_pattern: string;
     /** E.164 numbers whose texts are never drafted for (staff, the business's own numbers). */
     ignore_phone_numbers: string[];
+    /** Email senders (regex, case-insensitive, matched against the address) that are machines, not clients. */
+    email_skip_patterns: string[];
   };
   slots: {
     /** How many dates to offer. */
@@ -114,6 +116,10 @@ export const DEFAULT_SETTINGS: MessagingSettings = {
     sms_outbound_prefix: "SMS Sent to",
     chatbot_note_pattern: "chat|bot",
     ignore_phone_numbers: [],
+    email_skip_patterns: [
+      "^(no-?reply|do-?not-?reply|donotreply|mailer-daemon|postmaster|bounce|notifications?|alerts?|calendar-notification|drive-shares)[@.+-]",
+      "@(acuityscheduling|squarespace|jotform|pipedrive|pipedrivemail|google|googlemail|calendly|clicksend|facebookmail|instagram|stripe|paypal|xero|canva|shopify|mailchimp|linkedin|tiktok)\\.",
+    ],
   },
   slots: { offer_count: 3, lookahead_days: 42 },
 };

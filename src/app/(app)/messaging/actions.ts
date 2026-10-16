@@ -2,9 +2,9 @@
 
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
-import { isAdmin, requireWorkspace } from "@/lib/workspace";
+import { requireWorkspace } from "@/lib/workspace";
 import { audit, emitTelemetry } from "@/lib/telemetry";
-import { runSweep, saveDraftNoteToCrm } from "@/modules/messaging/sweep";
+import { runSweep, saveDraftNoteToCrm, type SweepReport } from "@/modules/messaging/sweep";
 import { MODULE_ID, MODULE_VERSION, type DraftEdit, type DraftPayload } from "@/modules/messaging/types";
 import { editSize } from "@/components/format";
 
@@ -159,15 +159,12 @@ export async function denyDraft(formData: FormData) {
   redirect("/messaging?done=denied");
 }
 
-export type SweepState =
-  | { proposed: number; skipped: number; blocked: number; errors: string[]; durationMs: number }
-  | { error: string }
-  | null;
+export type SweepState = SweepReport | { error: string } | null;
 
 // Takes the previous state because useActionState passes it; the sweep ignores it.
+// Any member can press Refresh: it only reads the sources and proposes drafts.
 export async function sweepNow(): Promise<SweepState> {
   const { userId, workspace } = await requireWorkspace();
-  if (!isAdmin(workspace)) return { error: "Only workspace admins can run a sweep." };
   try {
     return await runSweep(workspace.id, { trigger: "manual", actorUser: userId });
   } catch (e) {

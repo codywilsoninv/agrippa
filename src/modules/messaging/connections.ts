@@ -7,7 +7,7 @@ export const MESSAGING_CONNECTIONS: ModuleConnection[] = [
   {
     provider: "pipedrive",
     need: "required",
-    why: "Reads enquiries, client details and notes. Approved drafts are saved back as a note on the deal.",
+    why: "Reads clients, enquiries, notes, and the email synced into Pipedrive's Sales Inbox (the inbox of whoever owns the API token). Approved drafts are saved back as a note.",
   },
   {
     provider: "acuity",
@@ -22,6 +22,6 @@ export const MESSAGING_CONNECTIONS: ModuleConnection[] = [
   {
     provider: "gmail",
     need: "later",
-    why: "For reading email replies and sending emails from Agrippa (version 0.2).",
+    why: "Not needed while email syncs into Pipedrive.",
   },
 ];

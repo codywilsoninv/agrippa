@@ -47,23 +47,30 @@ Listed in code at `src/modules/messaging/connections.ts`; the Settings screen sh
 
 | Connection | Need | Used for |
 |---|---|---|
-| Pipedrive | Required | Enquiries, clients and notes; approved drafts saved back as a deal note |
+| Pipedrive | Required | Clients, enquiries (deals) and notes; the email synced into Pipedrive's Sales Inbox (read-only: the Mailbox API shows the inbox of whoever owns the API token, plus shared mail); the SMS activities the ClickSend integration logs against people. Approved drafts are saved back as a deal note |
+| ClickSend | Required | Every text in and out, straight from the carrier: the safety net for numbers Pipedrive doesn't know. Sending from Agrippa in v0.2 |
 | Acuity | Required | Artists' free days, so drafts only offer open dates |
-| ClickSend | Required | Every text in and out, whatever the deal's state (won, booked or lost clients still text). Sending from Agrippa in v0.2 |
-| Gmail | Later (v0.2) | Reading email replies and sending email. Needs Google sign-in, not built |
+| Gmail | Later | Not needed while email syncs into Pipedrive |
 
-## 5. Intake
-Listens for Items of kind: `crm_deal_created`, `sms_received` and `sms_sent` (ClickSend inbound and history; the source of truth for every text, whatever the deal's state), `email_received`, `email_sent` (to learn from what was actually sent). v0.1: only the manual sweep is built; no scheduled run.
+## 5. Intake: Refresh
+One button, **Refresh**, any member can press. It runs two steps:
 
-What the sweep reads today:
+**1. Refresh (collate, no AI).** Each connection remembers how far it has synced (`connections.last_synced_at`, `sync_state`: cursors and counts only). The first sync looks back 30 days; after that only what changed is pulled. Sources are independent: an error in one is reported and the others still run.
 
-| Source | What | Keyed by |
+| Source | What is pulled | Filed as |
 |---|---|---|
-| Pipedrive deals (configured pipeline, open) | New and gone-quiet enquiries, notes (chatbot transcript, form summary) | Job per deal (`enquiry`), conversation `deal:<id>` |
-| ClickSend inbound + history (last 30 days) | Every text in and out. A thread whose last text is inbound is **unreplied**, whether the client's deal is open, won, lost, booked, or there is no deal at all | Conversation per client number `sms:<E.164>`, messages by ClickSend `message_id` |
-| Pipedrive person search (by phone) | Who the number belongs to and their most relevant deal (open in our pipeline → any open → newest won/lost), for context | Job per deal; an unknown number gets a job of subtype `sms_only` ("Texts from …") so the one-open-draft rule still holds |
+| Pipedrive deals | Open deals in the configured pipeline updated since the cursor (≤60 per refresh), their person, their notes (chatbot transcript, form summary) | Job per deal (`enquiry`, deal status/stage kept as context under `custom.messaging`); notes into the person's `crm` conversation |
+| Pipedrive email (Sales Inbox) | Inbox and Sent threads with activity since the cursor (≤40 thread reads per refresh, one at a time: each costs 20 API tokens); quoted replies and signatures stripped; automated senders dropped (`crm.email_skip_patterns`) | Person's `email` conversation; messages by Pipedrive mail message id |
+| Pipedrive texts | SMS activities (subject prefixes in `crm.sms_*_prefix`) since the cursor | Person's `sms` conversation; deduped against ClickSend by (number, body, time within 2 minutes) |
+| ClickSend | Inbound and history since the cursor | Person's `sms` conversation; messages by ClickSend `message_id`; numbers in `crm.ignore_phone_numbers` skipped; a number nobody knows is looked up in Pipedrive (≤30 lookups per refresh) |
 
-Pipedrive's own SMS activities are not read while ClickSend is connected (they would duplicate the texts). ClickSend is read-only in v0.1; sending is a v0.2 approve-tier, labelled action.
+**2. Identity.** One client = one Person. Resolved in this order: Pipedrive person id → E.164 phone → lower-cased email (`identity.ts`, pure). A Person first seen by phone who later appears in Pipedrive gets the Pipedrive id attached; duplicates are merged (conversations, jobs and open drafts follow the surviving Person). Every message lands in a per-channel conversation (`person:<id>:<channel>`) linked through `conversation_participants`, and `store.timeline(person)` returns ONE timeline across channels, oldest first.
+
+**3. Waiting** (`waiting.ts`, pure, from the timeline, never from deals): **unreplied** = the latest message on any channel is inbound with nothing sent after it; **new** = an open deal in a 'new' stage (or created in the last 24h) with nothing sent yet; **quiet** = follow-up stage, our last message older than `quiet_after_hours`, nothing since. Deal status is context only (booked → don't re-quote); a stage with `treat_as: ignore` is the one deal-driven skip.
+
+**4. Draft (AI).** For people who are waiting (unreplied first, newest inbound first, ≤25 per refresh): classify, route, draft, hard rules, propose. No re-draft unless a new inbound arrived since the last decision. The screen reports per source ("Pipedrive: 2 new · ClickSend: 5 new · Pipedrive email: 3 new · 4 drafts ready"), "Last refreshed", and says when a cap was hit so the next press picks up the rest. `maxDuration` 300.
+
+Items of kind `crm_deal_created`, `sms_received`, `sms_sent`, `email_received`, `email_sent` are what each source produces conceptually; v0.1 pulls them inside Refresh rather than through the Items queue.
 
 ## 6. Brain
 | Part | Where |
@@ -93,9 +100,10 @@ Hard rules (conditions, checked in code before a draft is shown):
 **Open question for Cody (label rule):** Founding doc 3 says every outbound message carries a "sent by assistant" label that can be reworded but not removed. On a customer text that might read "Sent by Umbra's assistant". Keep as is, or propose a policy change for customer-facing messages that a human has approved word for word?
 
 ## 8. Interface
-| Screens | Messaging inbox (who's waiting, by priority), thread view (history + draft side by side), settings (voice, price book, routing table) |
+| Screens | Messaging inbox (who's waiting, by priority, with ONE primary button: Refresh), thread view (the person's whole timeline across texts, email and CRM notes, channel shown per message, with the draft beside it), settings (voice, price book, routing table, connections) |
 |---|---|
-| Assistant tools | "Make it shorter", "offer later dates", "switch artist", "redo as SMS", approve / deny |
+| Decisions | Approve and save to Pipedrive (deal known) · Copy and mark as sent (no deal: the final text goes to the clipboard on the click and is shown again after) · Deny |
+| Assistant tools | "Make it shorter", "offer later dates", "switch artist", "redo as SMS" (later) |
 
 ## 9. Tests
 Test set: `tests/unit/` (routing and hard rules) now; `src/modules/messaging/tests/` — 30 real past Umbra enquiries (names stripped) with the reply Cody actually sent. Pass bar to release a version: no hard-rule breaches, and ≥ 70% of drafts judged "send with light edits or none".

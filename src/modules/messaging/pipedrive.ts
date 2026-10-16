@@ -52,6 +52,25 @@ export type PipedriveNote = {
   user_id: number | null;
 };
 
+export type PipedriveMailParty = { email_address?: string | null; name?: string | null; linked_person_id?: number | null };
+export type PipedriveMailThread = {
+  id: number;
+  subject: string;
+  last_message_at: string; // ISO
+  message_count: number;
+  deal_id: number | null;
+  parties: { from: PipedriveMailParty[]; to: PipedriveMailParty[] };
+};
+export type PipedriveMailMessage = {
+  id: number;
+  thread_id: number;
+  from: PipedriveMailParty[];
+  to: PipedriveMailParty[];
+  subject: string;
+  body_html: string;
+  at: string; // ISO
+};
+
 export type PipedrivePerson = {
   id: number;
   name: string;
@@ -151,6 +170,12 @@ export class PipedriveClient {
   async me(): Promise<string> {
     const r = await this.request<{ company_name?: string; email?: string; name?: string }>("GET", "/api/v1/users/me");
     return r.data.company_name || r.data.email || r.data.name || "Pipedrive";
+  }
+
+  /** The token user's own email: mail from this address in the synced mailbox is ours (outbound). */
+  async myEmail(): Promise<string | null> {
+    const r = await this.request<{ email?: string }>("GET", "/api/v1/users/me");
+    return r.data.email?.toLowerCase() ?? null;
   }
 
   /** Open deals in one pipeline (v2 honours pipeline_id; v1 ignores it). */
@@ -282,6 +307,64 @@ export class PipedriveClient {
     return new Map((r.data ?? []).map((s) => [s.id, { name: s.name, pipeline_id: s.pipeline_id }]));
   }
 
+  // ---- Mailbox (Sales Inbox email sync), READ ONLY ------------------------
+  // Returns the API-token user's synced mailbox plus shared mail. Never call
+  // the update/delete thread endpoints (no mark-read, no archive).
+
+  /** Threads in a folder, newest activity first as far as the API orders them. `max` caps the scan. */
+  async listMailThreads(folder: "inbox" | "sent", max = 300): Promise<PipedriveMailThread[]> {
+    type Raw = {
+      id: number;
+      subject?: string | null;
+      last_message_timestamp?: string | null;
+      first_message_timestamp?: string | null;
+      message_count?: number;
+      deal_id?: number | null;
+      parties?: { to?: PipedriveMailParty[]; from?: PipedriveMailParty[]; cc?: PipedriveMailParty[] };
+      update_time?: string | null;
+    };
+    const rows = await this.listAllV1<Raw>("/api/v1/mailbox/mailThreads", { folder }, max);
+    return rows.map((r) => ({
+      id: r.id,
+      subject: r.subject ?? "",
+      last_message_at: pipedriveTime(r.last_message_timestamp ?? r.update_time ?? null).toISOString(),
+      message_count: r.message_count ?? 0,
+      deal_id: r.deal_id ?? null,
+      parties: { from: r.parties?.from ?? [], to: r.parties?.to ?? [] },
+    }));
+  }
+
+  /** Every message in a thread (20 API tokens each: call sparingly). Body is HTML, sometimes only via body_url. */
+  async getMailMessages(threadId: number): Promise<PipedriveMailMessage[]> {
+    type Raw = {
+      id: number;
+      from?: PipedriveMailParty[];
+      to?: PipedriveMailParty[];
+      subject?: string | null;
+      body?: string | null;
+      body_url?: string | null;
+      message_time?: string | null;
+      add_time?: string | null;
+      mail_thread_id?: number;
+    };
+    const r = await this.request<Raw[] | null>("GET", `/api/v1/mailbox/mailThreads/${threadId}/mailMessages`);
+    const out: PipedriveMailMessage[] = [];
+    for (const m of r.data ?? []) {
+      let body = m.body ?? "";
+      if (!body && m.body_url) body = await fetchBodyUrl(m.body_url);
+      out.push({
+        id: m.id,
+        thread_id: m.mail_thread_id ?? threadId,
+        from: m.from ?? [],
+        to: m.to ?? [],
+        subject: m.subject ?? "",
+        body_html: body,
+        at: pipedriveTime(m.message_time ?? m.add_time ?? null).toISOString(),
+      });
+    }
+    return out;
+  }
+
   /** The only write this module makes to the CRM. `text` is plain text; Pipedrive stores HTML. Returns the note id. */
   async addNote(dealId: number, text: string): Promise<number> {
     const r = await this.request<{ id: number }>("POST", "/api/v1/notes", {}, { deal_id: dealId, content: textToNoteHtml(text) });
@@ -290,6 +373,16 @@ export class PipedriveClient {
 
   dealUrl(dealId: number): string {
     return `${this.base}/deal/${dealId}`;
+  }
+}
+
+/** body_url is a short-lived signed link to the message HTML; no token needed, nothing logged. */
+async function fetchBodyUrl(url: string): Promise<string> {
+  try {
+    const res = await fetch(url, { cache: "no-store" });
+    return res.ok ? await res.text() : "";
+  } catch {
+    return "";
   }
 }
 

@@ -22,6 +22,6 @@ export async function lastSweep(workspaceId: string): Promise<SweepInfo> {
 
 export async function lastSweepSummary(workspaceId: string): Promise<string> {
   const sweep = await lastSweep(workspaceId);
-  if (!sweep) return "No sweep has run yet";
-  return `Sweep ran ${formatDateTime(sweep.at)} (${longAge(sweep.at)} ago)`;
+  if (!sweep) return "Not refreshed yet";
+  return `Last refreshed ${formatDateTime(sweep.at)} (${longAge(sweep.at)} ago)`;
 }

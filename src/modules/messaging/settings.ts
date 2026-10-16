@@ -14,6 +14,7 @@ export function mergeSettings(raw: unknown): MessagingSettings {
       ...DEFAULT_SETTINGS.crm,
       ...(stored.crm ?? {}),
       ignore_phone_numbers: Array.isArray(stored.crm?.ignore_phone_numbers) ? stored.crm.ignore_phone_numbers : [],
+      email_skip_patterns: Array.isArray(stored.crm?.email_skip_patterns) ? stored.crm.email_skip_patterns : DEFAULT_SETTINGS.crm.email_skip_patterns,
     },
     slots: { ...DEFAULT_SETTINGS.slots, ...(stored.slots ?? {}) },
     artists: Array.isArray(stored.artists) ? stored.artists : [],
@@ -52,6 +53,7 @@ export function validateSettings(s: MessagingSettings): string[] {
   if (!(s.crm.quiet_after_hours > 0)) problems.push("quiet_after_hours must be greater than 0.");
   if (!s.crm.sms_inbound_prefix.trim() || !s.crm.sms_outbound_prefix.trim()) problems.push("SMS activity subject prefixes are empty.");
   if (!isValidRegex(s.crm.chatbot_note_pattern)) problems.push("chatbot_note_pattern is not a valid regular expression.");
+  for (const p of s.crm.email_skip_patterns) if (!isValidRegex(p)) problems.push(`email_skip_patterns: "${p}" is not a valid regular expression.`);
   if (!(s.slots.offer_count > 0)) problems.push("slots.offer_count must be at least 1.");
   if (!(s.slots.lookahead_days > 0)) problems.push("slots.lookahead_days must be at least 1.");
   return problems;

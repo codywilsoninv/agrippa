@@ -40,13 +40,6 @@ export function pickRelevantDeal(deals: PipedriveDeal[], pipelineId: number): Pi
   return open.find((d) => d.pipeline_id === pipelineId) ?? open[0] ?? newestFirst.find((d) => d.status === "won" || d.status === "lost") ?? null;
 }
 
-/** Oldest-first threads: the time of the last inbound text, for ordering candidates. */
-export function lastInboundAt(texts: SmsRecord[]): number {
-  for (let i = texts.length - 1; i >= 0; i--) if (texts[i].direction === "inbound") return new Date(texts[i].at).getTime();
-  return 0;
-}
-
-
 /** Pipedrive times: RFC3339 (v2) or "YYYY-MM-DD HH:MM:SS" UTC (v1). */
 function crmTime(s: string): number {
   const t = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s) ? new Date(s.replace(" ", "T") + "Z") : new Date(s);
