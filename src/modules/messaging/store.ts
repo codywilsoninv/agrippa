@@ -25,7 +25,7 @@ export type PersonInput = {
 export type JobInput = {
   external_id: string;
   /** 'enquiry' (a CRM deal) or 'sms_only' (texts from a number with no deal). */
-  subtype?: "enquiry" | "sms_only";
+  subtype?: "enquiry" | "sms_only" | "email_only";
   title: string;
   status: string;
   client_person_id: string | null;

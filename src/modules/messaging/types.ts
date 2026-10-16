@@ -78,6 +78,8 @@ export type MessagingSettings = {
     sms_outbound_prefix: string;
     /** Regex (case-insensitive) that marks a deal note as a chatbot transcript. */
     chatbot_note_pattern: string;
+    /** Email senders (regex, case-insensitive, matched against the address) that are machines, not clients. */
+    email_skip_patterns: string[];
   };
   slots: {
     /** How many dates to offer. */
@@ -108,6 +110,10 @@ export const DEFAULT_SETTINGS: MessagingSettings = {
     sms_inbound_prefix: "Received SMS from",
     sms_outbound_prefix: "SMS Sent to",
     chatbot_note_pattern: "chat|bot",
+    email_skip_patterns: [
+      "^(no-?reply|do-?not-?reply|donotreply|mailer-daemon|postmaster|bounce|notifications?|alerts?|calendar-notification|drive-shares)[@.+-]",
+      "@(acuityscheduling|squarespace|jotform|pipedrive|pipedrivemail|google|googlemail|calendly|clicksend|facebookmail|instagram|stripe|paypal|xero|canva|shopify|mailchimp|linkedin|tiktok)\\.",
+    ],
   },
   slots: { offer_count: 3, lookahead_days: 42 },
 };

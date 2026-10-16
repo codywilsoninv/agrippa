@@ -13,8 +13,10 @@ import { audit, emitTelemetry } from "@/lib/telemetry";
 import { AcuityClient } from "./acuity";
 import { BrainError, classifyEnquiry, draftReply, sumUsage, type DraftInput, type ThreadMessage } from "./brain";
 import { ClickSendClient, type SmsRecord } from "./clicksend";
+import { readMail, type EmailRecord } from "./gmail";
+import { normaliseEmail } from "./mail";
 import { maskPhone, samePhone, searchDigits, toE164 } from "./phone";
-import { groupTexts, pickRelevantDeal, type TextThread } from "./texts";
+import { groupEmails, groupTexts, pickRelevantDeal, waitingOnUs, type EmailThread, type TextThread } from "./texts";
 import {
   PipedriveClient,
   noteToText,
@@ -38,6 +40,7 @@ export type SweepReport = { proposed: number; skipped: number; blocked: number; 
 const MAX_CLIENTS_PER_SWEEP = 25;
 const CONCURRENCY = 3;
 const SMS_LOOKBACK_DAYS = 30;
+const MAIL_LOOKBACK_DAYS = 30;
 const NEW_DEAL_HOURS = 24;
 const TELEMETRY_MODULE = { id: MODULE_ID, version: MODULE_VERSION };
 
@@ -73,6 +76,10 @@ type Candidate = {
   sms: PipedriveActivity[];
   /** ClickSend texts with this client, oldest first. */
   texts: SmsRecord[];
+  /** The client's email address when the thread runs over Gmail. */
+  email: string | null;
+  /** Gmail messages with this client, oldest first. */
+  emails: EmailRecord[];
 };
 
 
@@ -94,12 +101,15 @@ export async function runSweep(workspaceId: string, opts: { trigger: "manual" | 
   const clicksendConn = await getConnection(workspaceId, "clicksend");
   if (!clicksendConn) throw new Error("ClickSend isn't connected for this workspace. Texts can't be read without it.");
   const acuityConn = await getConnection(workspaceId, "acuity");
+  // Gmail is optional: without it, email replies are invisible to the sweep.
+  const gmailConn = await getConnection(workspaceId, "gmail");
 
   const crm = new PipedriveClient(pipedriveConn.secrets);
   const texts = new ClickSendClient(clicksendConn.secrets);
   const acuity = acuityConn ? new AcuityClient(acuityConn.secrets) : null;
   const crmStore = createStore(workspaceId, pipedriveConn.id);
   const smsStore = createStore(workspaceId, clicksendConn.id);
+  const mailStore = gmailConn ? createStore(workspaceId, gmailConn.id) : null;
   const nowIso = new Date(started).toISOString();
 
   // 1. Pull the pipeline, and every text in and out from ClickSend. Pipedrive's
@@ -108,29 +118,39 @@ export async function runSweep(workspaceId: string, opts: { trigger: "manual" | 
   // one-line change if a workspace ever runs without ClickSend.
   let deals: PipedriveDeal[];
   let records: SmsRecord[];
+  let mail: EmailRecord[] = [];
   const activities: PipedriveActivity[] = [];
   try {
     const sinceUnix = Math.floor((started - SMS_LOOKBACK_DAYS * 86_400_000) / 1000);
-    const [d, inbound, sent] = await Promise.all([crm.listOpenDeals(settings.crm.pipeline_id), texts.listInbound(sinceUnix), texts.listSent(sinceUnix)]);
+    const mailSince = new Date(started - MAIL_LOOKBACK_DAYS * 86_400_000);
+    const [d, inbound, sent, m] = await Promise.all([
+      crm.listOpenDeals(settings.crm.pipeline_id),
+      texts.listInbound(sinceUnix),
+      texts.listSent(sinceUnix),
+      gmailConn ? readMail(gmailConn.secrets, mailSince, settings.crm.email_skip_patterns) : Promise.resolve([] as EmailRecord[]),
+    ]);
     deals = d;
     records = [...inbound, ...sent];
+    mail = m;
   } catch (e) {
     if (e instanceof Error && /rejected the API token/.test(e.message)) await markConnectionError(workspaceId, pipedriveConn.id);
     if (e instanceof Error && /rejected the username/.test(e.message)) await markConnectionError(workspaceId, clicksendConn.id);
+    if (e instanceof Error && gmailConn && /AUTHENTICATIONFAILED|Invalid credentials/i.test(e.message)) await markConnectionError(workspaceId, gmailConn.id);
     throw e;
   }
 
-  // 2. Decide who is waiting on us: deals first, then every text thread the CRM
-  // doesn't surface (won, lost, booked, or no deal at all).
+  // 2. Decide who is waiting on us: deals first, then every text or email thread
+  // the CRM doesn't surface (won, lost, booked, or no deal at all).
   const dealCandidates = await shortlistDeals(crm, settings, deals, activities, nowIso, report);
   const threads = groupTexts(records);
-  const shortlist = await mergeTextThreads(crm, settings, dealCandidates, threads, report);
+  const emailThreads = gmailConn ? groupEmails(mail, gmailConn.secrets.email) : [];
+  const shortlist = await mergeThreads(crm, settings, dealCandidates, threads, emailThreads, nowIso, report);
   const slotFinder = createSlotFinder(acuity, settings, nowIso);
 
   // 3. Sync, route, draft, propose: a few at a time.
   await runLimited(shortlist.slice(0, MAX_CLIENTS_PER_SWEEP), CONCURRENCY, async (c) => {
     try {
-      const outcome = await processCandidate({ workspaceId, settings, crm, crmStore, smsStore, slotFinder, candidate: c, sweepId, nowIso });
+      const outcome = await processCandidate({ workspaceId, settings, crm, crmStore, smsStore, mailStore, slotFinder, candidate: c, sweepId, nowIso });
       report[outcome] += 1;
     } catch (e) {
       // Per-client failures never kill the batch. BrainError messages are ours (no content); others are library text.
@@ -144,7 +164,7 @@ export async function runSweep(workspaceId: string, opts: { trigger: "manual" | 
   await emitTelemetry(
     workspaceId,
     "messaging.sweep",
-    { trigger: opts.trigger, proposed: report.proposed, skipped: report.skipped, blocked: report.blocked, errors: report.errors.length, duration_ms: report.durationMs, deals_open: deals.length, text_threads: threads.length },
+    { trigger: opts.trigger, proposed: report.proposed, skipped: report.skipped, blocked: report.blocked, errors: report.errors.length, duration_ms: report.durationMs, deals_open: deals.length, text_threads: threads.length, email_threads: emailThreads.length },
     TELEMETRY_MODULE,
   );
   await audit(workspaceId, "messaging.sweep", {
@@ -240,7 +260,7 @@ async function shortlistDeals(
       return;
     }
     const notes = (await crm.getDealNotes(p.deal.id)).filter((n) => !DRAFT_NOTE_RE.test(noteToText(n.content)));
-    out.push({ ...p, key: `deal ${p.deal.id}`, person, phone: toE164(person.phone), stageName: p.stage?.name ?? null, notes, texts: [] });
+    out.push({ ...p, key: `deal ${p.deal.id}`, person, phone: toE164(person.phone), stageName: p.stage?.name ?? null, notes, texts: [], email: normaliseEmail(person.email), emails: [] });
   });
 
   // Duplicate deals for the same person (chatbot + form): keep the one with the conversation.
@@ -273,43 +293,68 @@ function activityTime(a: PipedriveActivity): Date {
 }
 
 // ---------------------------------------------------------------------------
-// Text threads from ClickSend: one per client number, whatever the deal state
+// Threads from ClickSend (per number) and Gmail (per address), whatever the deal state
 // ---------------------------------------------------------------------------
 
 /**
- * Attach each thread to its deal candidate when the number matches, and make a
- * new candidate for every unreplied thread the deal sweep didn't surface. An
- * unreplied text is urgent regardless of deal status (won, lost, booked, none).
+ * Attach each thread to its deal candidate when the number or address matches,
+ * then make a new candidate for every unreplied thread the deal sweep didn't
+ * surface. "Unreplied" is judged across both channels: the client's latest
+ * message is inbound and nothing went out after it, regardless of deal status.
  */
-async function mergeTextThreads(
+async function mergeThreads(
   crm: PipedriveClient,
   settings: MessagingSettings,
   dealCandidates: Candidate[],
   threads: TextThread[],
+  emailThreads: EmailThread[],
+  nowIso: string,
   report: SweepReport,
 ): Promise<Candidate[]> {
   const skipNames = new Set(settings.crm.skip_contact_names.map((n) => n.trim().toLowerCase()));
-  const matched = new Set<string>();
+  const matchedPhones = new Set<string>();
+  const matchedEmails = new Set<string>();
+  const quietMs = settings.crm.quiet_after_hours * 3_600_000;
+  const now = new Date(nowIso).getTime();
 
-  // Threads with a shortlisted deal: give the deal the text history; an unreplied text wins the bucket.
+  // Threads with a shortlisted deal: give the deal the history; an unreplied message wins the bucket.
+  const kept: Candidate[] = [];
   for (const c of dealCandidates) {
     const t = threads.find((th) => c.person?.phones.some((p) => samePhone(p, th.phone)));
-    if (!t) continue;
-    matched.add(t.phone);
-    c.texts = t.texts;
-    c.phone = t.phone;
-    if (t.unreplied) c.bucket = "unreplied";
+    if (t) {
+      matchedPhones.add(t.phone);
+      c.texts = t.texts;
+      c.phone = t.phone;
+    }
+    const e = emailThreads.find((th) => c.person?.emails.some((a) => normaliseEmail(a) === th.address));
+    if (e) {
+      matchedEmails.add(e.address);
+      c.emails = e.emails;
+      c.email = e.address;
+    }
+    const w = waitingOnUs(c.texts, c.emails);
+    if (w.unreplied) c.bucket = "unreplied";
+    // A client we've been talking to recently on any channel isn't "gone quiet".
+    else if (c.bucket === "quiet" && w.lastAt && now - new Date(w.lastAt).getTime() < quietMs) {
+      report.skipped += 1;
+      continue;
+    }
+    kept.push(c);
   }
 
-  // Unreplied threads with no shortlisted deal: look the number up and draft anyway.
+  // Unreplied threads with no shortlisted deal: look the client up and draft anyway.
+  type Pending = { kind: "sms"; thread: TextThread } | { kind: "email"; thread: EmailThread };
+  const pending: Pending[] = [
+    ...threads.filter((t) => t.unreplied && !matchedPhones.has(t.phone)).map((thread): Pending => ({ kind: "sms", thread })),
+    ...emailThreads.filter((t) => t.unreplied && !matchedEmails.has(t.address)).map((thread): Pending => ({ kind: "email", thread })),
+  ];
   const extra: Candidate[] = [];
-  const unmatched = threads.filter((t) => t.unreplied && !matched.has(t.phone));
   let stages: Map<number, { name: string; pipeline_id: number }> | null = null;
   const stageById = new Map(settings.crm.stages.map((s) => [s.id, s]));
-  await runLimited(unmatched, CONCURRENCY, async (t) => {
-    const index = unmatched.indexOf(t) + 1;
-    const key = `text thread ${index}`;
-    const person = await findPersonByPhone(crm, t.phone);
+  await runLimited(pending, CONCURRENCY, async (p) => {
+    const index = pending.indexOf(p) + 1;
+    const key = `${p.kind === "sms" ? "text" : "email"} thread ${index}`;
+    const person = p.kind === "sms" ? await findPersonByPhone(crm, p.thread.phone) : await findPersonByEmail(crm, p.thread.address);
     if (person && skipNames.has(person.name.trim().toLowerCase())) {
       report.skipped += 1;
       return;
@@ -326,11 +371,44 @@ async function mergeTextThreads(
       stages ??= await crm.listStages();
       stageName = stages.get(deal.stage_id)?.name ?? null;
     }
-    extra.push({ key, bucket: "unreplied", person, phone: t.phone, deal, stage, stageName, notes, sms: [], texts: t.texts });
+    // The same person may have texted and emailed: give the candidate both threads.
+    const phone = p.kind === "sms" ? p.thread.phone : (person?.phones.map((n) => toE164(n)).find((n) => n && threads.some((t) => t.phone === n)) ?? null);
+    const email = p.kind === "email" ? p.thread.address : (person?.emails.map((a) => normaliseEmail(a)).find((a) => a && emailThreads.some((t) => t.address === a)) ?? null);
+    const texts = phone ? (threads.find((t) => t.phone === phone)?.texts ?? []) : [];
+    const emails = email ? (emailThreads.find((t) => t.address === email)?.emails ?? []) : [];
+    extra.push({ key, bucket: "unreplied", person, phone, email, deal, stage, stageName, notes, sms: [], texts, emails });
+  });
+
+  // One candidate per person when both channels were pending for the same client.
+  const seenPerson = new Set<number>();
+  const deduped = extra.filter((c) => {
+    if (!c.person) return true;
+    if (seenPerson.has(c.person.id)) {
+      report.skipped += 1;
+      return false;
+    }
+    seenPerson.add(c.person.id);
+    return true;
   });
 
   const order: Record<Bucket, number> = { unreplied: 0, new: 1, quiet: 2 };
-  return [...dealCandidates, ...extra].sort((a, b) => order[a.bucket] - order[b.bucket]);
+  return [...kept, ...deduped].sort((a, b) => order[a.bucket] - order[b.bucket]);
+}
+
+const personByEmail = new Map<string, Promise<PipedrivePerson | null>>();
+
+/** CRM person for an address, cached per process. */
+function findPersonByEmail(crm: PipedriveClient, address: string): Promise<PipedrivePerson | null> {
+  let p = personByEmail.get(address);
+  if (!p) {
+    p = crm
+      .searchPersonsByEmail(address)
+      .then((people) => people.find((x) => x.emails.some((a) => normaliseEmail(a) === address)) ?? people[0] ?? null)
+      .catch(() => null);
+    personByEmail.set(address, p);
+    setTimeout(() => personByEmail.delete(address), 10 * 60_000).unref?.();
+  }
+  return p;
 }
 
 const personByPhone = new Map<string, Promise<PipedrivePerson | null>>();
@@ -361,6 +439,8 @@ type ProcessArgs = {
   crmStore: Store;
   /** Rows keyed by ClickSend ids / phone numbers. */
   smsStore: Store;
+  /** Rows keyed by Gmail Message-IDs / addresses. Null when Gmail isn't connected. */
+  mailStore: Store | null;
   slotFinder: SlotFinder;
   candidate: Candidate;
   sweepId: string;
@@ -368,17 +448,20 @@ type ProcessArgs = {
 };
 
 async function processCandidate(args: ProcessArgs): Promise<"proposed" | "skipped" | "blocked"> {
-  const { workspaceId, settings, crm, crmStore, smsStore, candidate, sweepId, nowIso } = args;
-  const { deal, person, phone, bucket, sms, notes, stage, texts } = candidate;
+  const { workspaceId, settings, crm, crmStore, smsStore, mailStore, candidate, sweepId, nowIso } = args;
+  const { deal, person, phone, email, bucket, sms, notes, stage, texts, emails } = candidate;
   const t0 = Date.now();
-  const clientName = person?.name ?? `Unknown (${phone ?? "no number"})`;
+  const clientName = person?.name ?? `Unknown (${phone ?? email ?? "no contact"})`;
   const booked = deal !== null && (deal.status === "won" || stage?.treat_as === "booked");
 
   // Sync core types. People and deals are keyed by Pipedrive ids; a number the
   // CRM doesn't know gets a person and a job keyed by the number instead.
+  // An unknown client is keyed by whichever contact detail we have for them.
+  const contactStore = phone || !mailStore ? smsStore : mailStore;
+  const contactKey = phone ? `phone:${phone}` : `email:${email}`;
   const personId = person
-    ? await crmStore.upsertPerson({ external_id: String(person.id), name: person.name, email: person.email, phone: person.phone ?? phone })
-    : await smsStore.upsertPerson({ external_id: `phone:${phone}`, name: clientName, email: null, phone });
+    ? await crmStore.upsertPerson({ external_id: String(person.id), name: person.name, email: person.email ?? email, phone: person.phone ?? phone })
+    : await contactStore.upsertPerson({ external_id: contactKey, name: clientName, email, phone });
   const jobId = deal
     ? await crmStore.upsertJob({
         external_id: String(deal.id),
@@ -388,13 +471,13 @@ async function processCandidate(args: ProcessArgs): Promise<"proposed" | "skippe
         // Module data lives under its own key; the rest of `custom` is the company's field space.
         custom: { messaging: { pipedrive_stage_id: deal.stage_id, stage_name: candidate.stageName, deal_status: deal.status, pipedrive_url: crm.dealUrl(deal.id) } },
       })
-    : await smsStore.upsertJob({
-        external_id: `sms:${phone}`,
-        subtype: "sms_only",
-        title: `Texts from ${clientName}`,
+    : await contactStore.upsertJob({
+        external_id: phone ? `sms:${phone}` : `email:${email}`,
+        subtype: phone ? "sms_only" : "email_only",
+        title: `${phone ? "Texts" : "Emails"} from ${clientName}`,
         status: "open",
         client_person_id: personId,
-        custom: { messaging: { phone } },
+        custom: { messaging: { phone, email } },
       });
 
   const conversationIds: string[] = [];
@@ -423,6 +506,18 @@ async function processCandidate(args: ProcessArgs): Promise<"proposed" | "skippe
     });
     conversationIds.push(smsConversation);
     newMessages += await smsStore.addMessages(smsConversation, textsAsMessages(texts, person?.name ?? null));
+  }
+  if (emails.length > 0 && email && mailStore) {
+    // One email thread per person, across subjects.
+    const mailConversation = await mailStore.upsertConversation({
+      external_id: `email:${email}`,
+      job_id: jobId,
+      subtype: "email_thread",
+      occurred_at: emails[0].at,
+      title: `Emails with ${clientName}`,
+    });
+    conversationIds.push(mailConversation);
+    newMessages += await mailStore.addMessages(mailConversation, emailsAsMessages(emails, person?.name ?? null));
   }
   const latestInbound = await crmStore.latestInboundAt(conversationIds);
   const inboundAfter = (iso: string) => (latestInbound ? new Date(latestInbound).getTime() > new Date(iso).getTime() : false);
@@ -455,7 +550,9 @@ async function processCandidate(args: ProcessArgs): Promise<"proposed" | "skippe
   }
 
   // Draft, with hard rules inside.
-  const channelHint: "sms" | "email" = texts.length > 0 || sms.length > 0 ? "sms" : "email";
+  // The draft follows the channel the client last used.
+  const waiting = waitingOnUs(texts, emails);
+  const channelHint: "sms" | "email" = waiting.lastInboundChannel ?? (texts.length > 0 || sms.length > 0 ? "sms" : "email");
   const crmContext: DraftInput["crmContext"] = deal ? { title: deal.title, status: deal.status === "deleted" ? "lost" : deal.status, stage_name: candidate.stageName, treat_as: stage?.treat_as ?? null } : null;
   const result = await draftReply(workspaceId, { settings, thread: brainThread, classification, bucket, slots, channelHint, nowIso, crmContext });
   const cost = sumUsage([classifyUsage, ...result.usage]);
@@ -469,10 +566,11 @@ async function processCandidate(args: ProcessArgs): Promise<"proposed" | "skippe
 
   const lastInboundMsg = [...brainThread].reverse().find((m) => m.direction === "inbound");
   const extraFlags: string[] = [];
-  if (!person) extraFlags.push(`Unknown number: no Pipedrive person has this phone (${maskPhone(phone ?? "")}). Check who it is; the note can't be saved to a deal.`);
+  if (!person && phone) extraFlags.push(`Unknown number: no Pipedrive person has this phone (${maskPhone(phone)}). Check who it is; the note can't be saved to a deal.`);
+  else if (!person) extraFlags.push("Unknown sender: no Pipedrive person has this email address. Check who it is; the note can't be saved to a deal.");
   else if (!deal) extraFlags.push("This person has no deal in Pipedrive, so the note can't be saved to a deal.");
   else if (booked) extraFlags.push(`Already booked (deal "${deal.title}"${candidate.stageName ? `, ${candidate.stageName}` : ""}): check the draft answers what they asked and doesn't re-quote.`);
-  const contactEmail = person?.email ?? null;
+  const contactEmail = email ?? normaliseEmail(person?.email) ?? person?.email ?? null;
   const contactPhone = phone ?? toE164(person?.phone) ?? person?.phone ?? null;
   const payload: DraftPayload = {
     job_id: jobId,
@@ -502,7 +600,7 @@ async function processCandidate(args: ProcessArgs): Promise<"proposed" | "skippe
   await emitTelemetry(
     workspaceId,
     "messaging.draft_proposed",
-    { bucket, channel: payload.channel, slots: slots.length, attempts: result.attempts, replaced: open ? 1 : 0, has_deal: deal ? 1 : 0, known_person: person ? 1 : 0, booked: booked ? 1 : 0 },
+    { bucket, channel: payload.channel, slots: slots.length, attempts: result.attempts, replaced: open ? 1 : 0, has_deal: deal ? 1 : 0, known_person: person ? 1 : 0, booked: booked ? 1 : 0, via_email: emails.length > 0 ? 1 : 0 },
     TELEMETRY_MODULE,
   );
   await emitTelemetry(workspaceId, "messaging.latency_ms", { bucket, ms: latency, outcome: "proposed" }, TELEMETRY_MODULE);
@@ -570,6 +668,18 @@ function textsAsMessages(texts: SmsRecord[], clientName: string | null): Message
     author: t.direction === "inbound" ? clientName : null,
     body: t.body.trim(),
     sent_at: t.at,
+  }));
+}
+
+/** Gmail messages, deduped by Message-ID. The subject rides along in the body so the brain sees it. */
+function emailsAsMessages(emails: EmailRecord[], clientName: string | null): MessageInput[] {
+  return emails.map((e) => ({
+    external_id: `email:${e.id}`,
+    direction: e.direction,
+    channel: "email" as const,
+    author: e.direction === "inbound" ? clientName : null,
+    body: e.subject ? `Subject: ${e.subject}\n\n${e.body}` : e.body,
+    sent_at: e.at,
   }));
 }
 

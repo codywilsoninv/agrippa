@@ -21,7 +21,7 @@ export const MESSAGING_CONNECTIONS: ModuleConnection[] = [
   },
   {
     provider: "gmail",
-    need: "later",
-    why: "For reading email replies and sending emails from Agrippa (version 0.2).",
+    need: "optional",
+    why: "Reads email replies and the emails you send, so clients who answered by email aren't chased. Read-only.",
   },
 ];

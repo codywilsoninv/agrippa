@@ -241,6 +241,21 @@ export class PipedriveClient {
     }));
   }
 
+  /** People with exactly this email address (v2 search, `fields=email`, exact match). */
+  async searchPersonsByEmail(address: string): Promise<PipedrivePerson[]> {
+    type Item = { item: { id: number; name: string; phones?: string[]; emails?: string[] } };
+    const r = await this.request<{ items: Item[] } | null>("GET", "/api/v2/persons/search", { term: address, fields: "email", exact_match: "true", limit: 20 });
+    return (r.data?.items ?? []).map(({ item }) => ({
+      id: item.id,
+      name: item.name,
+      email: item.emails?.[0] ?? null,
+      phone: item.phones?.[0] ?? null,
+      emails: item.emails ?? [],
+      phones: item.phones ?? [],
+      add_time: "",
+    }));
+  }
+
   /** Every non-deleted deal of a person (open, won, lost), newest update first. */
   async listDealsForPerson(personId: number): Promise<PipedriveDeal[]> {
     type Raw = Omit<PipedriveDeal, "person_id"> & { person_id: number | { value: number } | null };

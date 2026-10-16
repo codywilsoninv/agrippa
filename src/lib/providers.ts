@@ -74,9 +74,21 @@ export const PROVIDERS: Record<Provider, ProviderGuide> = {
   },
   gmail: {
     name: "Gmail",
-    available: false,
-    fields: [],
-    steps: ["Gmail connects with a Google sign-in button rather than a key. It isn't built yet."],
+    available: true,
+    fields: [
+      { name: "email", label: "Gmail address", placeholder: "you@yourcompany.com" },
+      { name: "app_password", label: "App password", type: "password", hint: "16 letters from Google; spaces are fine" },
+    ],
+    steps: [
+      "Sign in to the Google account whose inbox you want Agrippa to read (for example bookings@yourcompany.com).",
+      "Go to myaccount.google.com and click Security in the left menu.",
+      "Under \"How you sign in to Google\", make sure 2-Step Verification is On. If it's off, click it and follow the steps to turn it on first.",
+      "Go to myaccount.google.com/apppasswords (you may be asked to sign in again).",
+      "In the App name box type Agrippa, then click Create.",
+      "Google shows a 16-letter code once. Copy it and paste it into App password here, then type the Gmail address into Gmail address.",
+    ],
+    caution:
+      "If Google says the setting isn't available, the Workspace admin has turned app passwords off (Admin console → Security → Authentication → 2-Step Verification). Agrippa only reads mail; it never sends.",
   },
 };
 

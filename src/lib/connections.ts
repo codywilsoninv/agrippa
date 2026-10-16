@@ -10,13 +10,16 @@ import { decryptJson, encryptJson } from "@/lib/crypto";
 
 import type { Provider as AnyProvider } from "@/lib/providers";
 
-// Providers connected with keys today (Gmail will connect by Google sign-in).
-export type Provider = Exclude<AnyProvider, "gmail">;
+// Every provider connects with a key or an app password today (Gmail uses a
+// Google app password over IMAP; OAuth is ruled out by Google's review process).
+export type Provider = AnyProvider;
 
 export type ProviderSecrets = {
   pipedrive: { api_token: string; company_domain: string };
   acuity: { user_id: string; api_key: string };
   clicksend: { username: string; api_key: string };
+  /** app_password is stored without the spaces Google shows. */
+  gmail: { email: string; app_password: string };
 };
 
 export type ConnectionRow = {

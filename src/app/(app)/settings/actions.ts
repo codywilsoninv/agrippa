@@ -7,6 +7,7 @@ import { audit } from "@/lib/telemetry";
 import { testPipedrive } from "@/modules/messaging/pipedrive";
 import { testAcuity } from "@/modules/messaging/acuity";
 import { testClickSend } from "@/modules/messaging/clicksend";
+import { testGmail } from "@/modules/messaging/gmail";
 import { PROVIDERS } from "@/lib/providers";
 import { mergeSettings, validateSettings } from "@/modules/messaging/sweep";
 import { MODULE_ID, type MessagingSettings } from "@/modules/messaging/types";
@@ -21,7 +22,7 @@ async function requireAdmin() {
 
 // Connections: one action for every key-based provider. Test the credentials
 // first; only store them if the provider answers.
-type KeyProvider = "pipedrive" | "acuity" | "clicksend";
+type KeyProvider = "pipedrive" | "acuity" | "clicksend" | "gmail";
 
 function read(formData: FormData, name: string) {
   return String(formData.get(name) ?? "").trim();
@@ -45,6 +46,14 @@ async function testAndBuild(provider: KeyProvider, formData: FormData) {
     const secrets = { user_id, api_key };
     return { secrets, test: await testAcuity(secrets) } as const;
   }
+  if (provider === "gmail") {
+    const email = read(formData, "email").toLowerCase();
+    const app_password = read(formData, "app_password").replace(/\s+/g, "");
+    if (!email || !app_password) return { error: "Enter both the Gmail address and the app password." } as const;
+    if (app_password.length !== 16) return { error: "The app password is 16 letters (spaces don't matter)." } as const;
+    const secrets = { email, app_password };
+    return { secrets, test: await testGmail(secrets) } as const;
+  }
   const username = read(formData, "username");
   const api_key = read(formData, "api_key");
   if (!username || !api_key) return { error: "Enter both the API username and the API key." } as const;
@@ -56,7 +65,7 @@ export async function saveProviderConnection(_prev: FormState, formData: FormDat
   const { userId, workspace, denied } = await requireAdmin();
   if (denied) return { error: denied };
   const provider = read(formData, "provider") as KeyProvider;
-  if (!["pipedrive", "acuity", "clicksend"].includes(provider)) return { error: "Unknown connection." };
+  if (!["pipedrive", "acuity", "clicksend", "gmail"].includes(provider)) return { error: "Unknown connection." };
   const name = PROVIDERS[provider].name;
 
   const built = await testAndBuild(provider, formData);
