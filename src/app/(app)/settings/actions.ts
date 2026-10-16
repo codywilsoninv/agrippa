@@ -6,6 +6,8 @@ import { saveConnection } from "@/lib/connections";
 import { audit } from "@/lib/telemetry";
 import { testPipedrive } from "@/modules/messaging/pipedrive";
 import { testAcuity } from "@/modules/messaging/acuity";
+import { testClickSend } from "@/modules/messaging/clicksend";
+import { PROVIDERS } from "@/lib/providers";
 import { mergeSettings, validateSettings } from "@/modules/messaging/sweep";
 import { MODULE_ID, type MessagingSettings } from "@/modules/messaging/types";
 
@@ -17,45 +19,56 @@ async function requireAdmin() {
   return { ...ctx, denied: null };
 }
 
-// Connections: test the credentials first; only store them if the provider answers.
-export async function savePipedrive(_prev: FormState, formData: FormData): Promise<FormState> {
-  const { userId, workspace, denied } = await requireAdmin();
-  if (denied) return { error: denied };
-  const company_domain = String(formData.get("company_domain") ?? "")
-    .trim()
-    .toLowerCase()
-    .replace(/^https?:\/\//, "")
-    .replace(/\.pipedrive\.com.*$/, "");
-  const api_token = String(formData.get("api_token") ?? "").trim();
-  if (!company_domain || !api_token) return { error: "Enter both the company domain and the API token." };
+// Connections: one action for every key-based provider. Test the credentials
+// first; only store them if the provider answers.
+type KeyProvider = "pipedrive" | "acuity" | "clicksend";
 
-  const test = await testPipedrive({ api_token, company_domain });
-  if (!test.ok) return { error: "Pipedrive didn't accept those details: " + test.error };
-  try {
-    await saveConnection(workspace.id, "pipedrive", { api_token, company_domain }, test.account);
-  } catch (e) {
-    return { error: e instanceof Error ? e.message : "Couldn't save the connection." };
-  }
-  await audit(workspace.id, "connection.saved", { actorUser: userId, objectType: "connection", detail: { provider: "pipedrive" } });
-  return { ok: `Pipedrive connected as ${test.account}.` };
+function read(formData: FormData, name: string) {
+  return String(formData.get(name) ?? "").trim();
 }
 
-export async function saveAcuity(_prev: FormState, formData: FormData): Promise<FormState> {
+async function testAndBuild(provider: KeyProvider, formData: FormData) {
+  if (provider === "pipedrive") {
+    const company_domain = read(formData, "company_domain")
+      .toLowerCase()
+      .replace(/^https?:\/\//, "")
+      .replace(/\.pipedrive\.com.*$/, "");
+    const api_token = read(formData, "api_token");
+    if (!company_domain || !api_token) return { error: "Enter both the company domain and the API token." } as const;
+    const secrets = { api_token, company_domain };
+    return { secrets, test: await testPipedrive(secrets) } as const;
+  }
+  if (provider === "acuity") {
+    const user_id = read(formData, "user_id");
+    const api_key = read(formData, "api_key");
+    if (!user_id || !api_key) return { error: "Enter both the User ID and the API key." } as const;
+    const secrets = { user_id, api_key };
+    return { secrets, test: await testAcuity(secrets) } as const;
+  }
+  const username = read(formData, "username");
+  const api_key = read(formData, "api_key");
+  if (!username || !api_key) return { error: "Enter both the API username and the API key." } as const;
+  const secrets = { username, api_key };
+  return { secrets, test: await testClickSend(secrets) } as const;
+}
+
+export async function saveProviderConnection(_prev: FormState, formData: FormData): Promise<FormState> {
   const { userId, workspace, denied } = await requireAdmin();
   if (denied) return { error: denied };
-  const user_id = String(formData.get("user_id") ?? "").trim();
-  const api_key = String(formData.get("api_key") ?? "").trim();
-  if (!user_id || !api_key) return { error: "Enter both the user id and the API key." };
+  const provider = read(formData, "provider") as KeyProvider;
+  if (!["pipedrive", "acuity", "clicksend"].includes(provider)) return { error: "Unknown connection." };
+  const name = PROVIDERS[provider].name;
 
-  const test = await testAcuity({ user_id, api_key });
-  if (!test.ok) return { error: "Acuity didn't accept those details: " + test.error };
+  const built = await testAndBuild(provider, formData);
+  if ("error" in built) return { error: built.error };
+  if (!built.test.ok) return { error: `${name} didn't accept those details: ${built.test.error}` };
   try {
-    await saveConnection(workspace.id, "acuity", { user_id, api_key }, test.account);
+    await saveConnection(workspace.id, provider, built.secrets as never, built.test.account);
   } catch (e) {
     return { error: e instanceof Error ? e.message : "Couldn't save the connection." };
   }
-  await audit(workspace.id, "connection.saved", { actorUser: userId, objectType: "connection", detail: { provider: "acuity" } });
-  return { ok: `Acuity connected as ${test.account}.` };
+  await audit(workspace.id, "connection.saved", { actorUser: userId, objectType: "connection", detail: { provider } });
+  return { ok: `${name} connected as ${built.test.account}.` };
 }
 
 // Module on/off. Upserts the workspace_modules row, keeping any settings already there.

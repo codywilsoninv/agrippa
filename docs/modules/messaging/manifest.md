@@ -43,17 +43,14 @@ How Umbra's world maps onto core types (company layer, set as data):
 | Quote / deposit | Transaction | kind `quote` stays a field on Job until money moves |
 
 ## 4. Connections
-| Required capability | Umbra uses |
-|---|---|
-| Read enquiries and their history | Pipedrive (deals, activities, notes, persons) |
-| Read the email inbox and sent folder | Gmail (bookings@) |
-| Read staff availability | Acuity (read only) |
+Listed in code at `src/modules/messaging/connections.ts`; the Settings screen shows each one with why it's needed and step-by-step instructions for finding the keys (`src/lib/providers.ts`).
 
-| Optional capability | Unlocks |
-|---|---|
-| Write a note to the CRM | Draft lands on the Pipedrive deal (today's workflow) |
-| Send email | "Send" from Agrippa instead of copying out |
-| Send SMS | Same, for texts (ClickSend via Pipedrive) |
+| Connection | Need | Used for |
+|---|---|---|
+| Pipedrive | Required | Enquiries, clients and notes; approved drafts saved back as a deal note |
+| Acuity | Required | Artists' free days, so drafts only offer open dates |
+| ClickSend | Required | Every text in and out, whatever the deal's state (won, booked or lost clients still text). Sending from Agrippa in v0.2 |
+| Gmail | Later (v0.2) | Reading email replies and sending email. Needs Google sign-in, not built |
 
 ## 5. Intake
 Listens for Items of kind: `crm_deal_created`, `crm_activity_logged` (inbound SMS), `email_received`, `email_sent` (to learn from what was actually sent) (v0.1: only the manual sweep is built; no scheduled run).
