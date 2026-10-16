@@ -2,7 +2,8 @@
 // them into core types, routes and drafts a reply for each, and proposes it as
 // an 'approve'-tier action. Nothing is ever sent from here.
 //
-// Runs on a schedule (cron route) or on demand from the inbox screen. Built to
+// Runs on demand from the inbox screen (no schedule yet: the module's own
+// automations will decide when it runs). Built to
 // finish inside a serverless window: capped clients per run, limited
 // concurrency, and per-client errors are collected rather than fatal.
 

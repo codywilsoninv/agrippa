@@ -20,7 +20,7 @@ Customer enquiries wait too long for a reply because each one needs someone to r
 |---|---|
 | Decision | "Who is waiting on us, and what do we say back?" |
 | Owner | Whoever answers enquiries (Umbra: Cody) |
-| Trigger | A new enquiry or inbound message arrives, a thread goes quiet past the chaser window, or the daily sweep runs |
+| Trigger | A person presses "Run sweep now". Automatic triggers (new enquiry, inbound message, thread gone quiet) will come from the module's own automations, not a fixed daily schedule. |
 | Value | Enquiries per week × (minutes to draft each + bookings lost to slow replies) |
 
 ## 3. Data
@@ -56,7 +56,7 @@ How Umbra's world maps onto core types (company layer, set as data):
 | Send SMS | Same, for texts (ClickSend via Pipedrive) |
 
 ## 5. Intake
-Listens for Items of kind: `crm_deal_created`, `crm_activity_logged` (inbound SMS), `email_received`, `email_sent` (to learn from what was actually sent), and a scheduled `daily_sweep`.
+Listens for Items of kind: `crm_deal_created`, `crm_activity_logged` (inbound SMS), `email_received`, `email_sent` (to learn from what was actually sent) (v0.1: only the manual sweep is built; no scheduled run).
 
 ## 6. Brain
 | Part | Where |
