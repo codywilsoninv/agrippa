@@ -9,7 +9,9 @@ import { WorkspaceRename } from "@/components/workspace-rename";
 import { formatDateTime } from "@/components/format";
 import { loadModuleState } from "../messaging/data";
 import { renameWorkspace } from "../workspace-actions";
-import { saveAcuity, savePipedrive, saveSettings, setModuleEnabled } from "./actions";
+import { saveProviderConnection, saveSettings, setModuleEnabled } from "./actions";
+import { PROVIDERS } from "@/lib/providers";
+import { MESSAGING_CONNECTIONS } from "@/modules/messaging/connections";
 
 export const metadata = { title: "Settings · Agrippa" };
 
@@ -37,6 +39,8 @@ export default async function SettingsPage({ searchParams }: { searchParams: Sea
     const c = connections.find((x) => x.provider === p);
     return c ? { status: c.status, account: c.external_account, updatedAt: c.updated_at } : null;
   };
+  const required = MESSAGING_CONNECTIONS.filter((c) => c.need === "required");
+  const requiredDone = required.filter((c) => byProvider(c.provider)?.status === "connected").length;
   const personFor = new Map((people ?? []).map((p) => [p.user_id, p]));
   const settingsJson = JSON.stringify(module.settings, null, 2);
 
@@ -55,30 +59,24 @@ export default async function SettingsPage({ searchParams }: { searchParams: Sea
       </header>
 
       <section id="connections" aria-labelledby="connections-title" className="flex flex-col gap-4">
-        <SectionTitle id="connections-title" title="Connections" blurb="Where Messaging reads enquiries and staff availability from. Keys are tested before they are stored, and never shown again." />
+        <SectionTitle
+          id="connections-title"
+          title="Connections"
+          blurb={`Messaging needs ${required.length} connection${required.length === 1 ? "" : "s"} to work: ${requiredDone} of ${required.length} connected. Keys are tested before they are stored, and never shown again.`}
+        />
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-          <ConnectionForm
-            provider="pipedrive"
-            title="Pipedrive"
-            status={byProvider("pipedrive")}
-            canEdit={admin}
-            action={savePipedrive}
-            fields={[
-              { name: "company_domain", label: "Company domain", placeholder: "yourcompany", hint: "The first part of your Pipedrive address: <domain>.pipedrive.com" },
-              { name: "api_token", label: "API token", type: "password", hint: "Pipedrive: Settings, Personal preferences, API." },
-            ]}
-          />
-          <ConnectionForm
-            provider="acuity"
-            title="Acuity Scheduling"
-            status={byProvider("acuity")}
-            canEdit={admin}
-            action={saveAcuity}
-            fields={[
-              { name: "user_id", label: "User id", hint: "Acuity: Settings, Integrations, API." },
-              { name: "api_key", label: "API key", type: "password" },
-            ]}
-          />
+          {MESSAGING_CONNECTIONS.map((c) => (
+            <ConnectionForm
+              key={c.provider}
+              provider={c.provider}
+              guide={PROVIDERS[c.provider]}
+              need={c.need}
+              why={c.why}
+              status={byProvider(c.provider)}
+              canEdit={admin}
+              action={saveProviderConnection}
+            />
+          ))}
         </div>
       </section>
 

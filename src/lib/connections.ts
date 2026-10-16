@@ -8,11 +8,15 @@ import { decryptJson, encryptJson } from "@/lib/crypto";
 // can read. The public `connections` row is written as the signed-in user, so
 // row-level security proves they are an admin of that workspace first.
 
-export type Provider = "pipedrive" | "acuity";
+import type { Provider as AnyProvider } from "@/lib/providers";
+
+// Providers connected with keys today (Gmail will connect by Google sign-in).
+export type Provider = Exclude<AnyProvider, "gmail">;
 
 export type ProviderSecrets = {
   pipedrive: { api_token: string; company_domain: string };
   acuity: { user_id: string; api_key: string };
+  clicksend: { username: string; api_key: string };
 };
 
 export type ConnectionRow = {

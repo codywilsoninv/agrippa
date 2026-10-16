@@ -1,4 +1,6 @@
 import Link from "next/link";
+import { PROVIDERS } from "@/lib/providers";
+import { MESSAGING_CONNECTIONS } from "@/modules/messaging/connections";
 import { isAdmin, requireWorkspace } from "@/lib/workspace";
 import { listConnections } from "@/lib/connections";
 import { DraftList } from "@/components/draft-list";
@@ -30,7 +32,9 @@ export default async function MessagingPage({ searchParams }: { searchParams: Se
   ]);
 
   const connected = connections.filter((c) => c.status === "connected").map((c) => c.provider);
-  const hasPipedrive = connected.includes("pipedrive");
+  const missing = MESSAGING_CONNECTIONS.filter(
+    (c) => c.need === "required" && !connected.includes(c.provider as (typeof connected)[number]),
+  );
 
   if (!module.enabled) {
     return (
@@ -41,11 +45,12 @@ export default async function MessagingPage({ searchParams }: { searchParams: Se
       </Empty>
     );
   }
-  if (!hasPipedrive) {
+  if (missing.length > 0) {
     return (
-      <Empty title="Connect your CRM first">
+      <Empty title="Finish connecting Messaging">
         <p className="m-0">
-          Messaging reads enquiries from Pipedrive. Add it under <Link href="/settings#connections">Settings</Link>.
+          Messaging still needs {missing.map((c) => PROVIDERS[c.provider].name).join(" and ")}. Each one has step-by-step
+          instructions under <Link href="/settings#connections">Settings, Connections</Link>.
         </p>
       </Empty>
     );
