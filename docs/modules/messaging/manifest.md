@@ -47,9 +47,9 @@ Listed in code at `src/modules/messaging/connections.ts`; the Settings screen sh
 
 | Connection | Need | Used for |
 |---|---|---|
-| Pipedrive | Required | Enquiries, clients, notes and the texts ClickSend logs there; approved drafts saved back as a deal note |
+| Pipedrive | Required | Enquiries, clients and notes; approved drafts saved back as a deal note |
 | Acuity | Required | Artists' free days, so drafts only offer open dates |
-| ClickSend | Later (v0.2) | Sending texts from Agrippa. Not used in v0.1 |
+| ClickSend | Required | Every text in and out, whatever the deal's state (won, booked or lost clients still text). Sending from Agrippa in v0.2 |
 | Gmail | Later (v0.2) | Reading email replies and sending email. Needs Google sign-in, not built |
 
 ## 5. Intake

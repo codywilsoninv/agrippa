@@ -7,7 +7,7 @@ export const MESSAGING_CONNECTIONS: ModuleConnection[] = [
   {
     provider: "pipedrive",
     need: "required",
-    why: "Reads enquiries, client details, notes and the texts ClickSend logs there. Approved drafts are saved back as a note on the deal.",
+    why: "Reads enquiries, client details and notes. Approved drafts are saved back as a note on the deal.",
   },
   {
     provider: "acuity",
@@ -16,8 +16,8 @@ export const MESSAGING_CONNECTIONS: ModuleConnection[] = [
   },
   {
     provider: "clicksend",
-    need: "later",
-    why: "For sending texts straight from Agrippa (version 0.2). Not used yet: texts are read from Pipedrive.",
+    need: "required",
+    why: "Reads every text in and out, including from clients whose deal is already won, booked or lost. Sending from Agrippa comes in version 0.2.",
   },
   {
     provider: "gmail",

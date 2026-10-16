@@ -70,7 +70,7 @@ export const PROVIDERS: Record<Provider, ProviderGuide> = {
       "Copy the Username into API username here.",
       "Copy the API Key into API key.",
     ],
-    caution: "This key can send texts that cost money. Agrippa never sends without a person approving each message.",
+    caution: "This key could also send texts, which cost money. Agrippa only reads texts for now, and when sending arrives, every message needs a person to approve it.",
   },
   gmail: {
     name: "Gmail",
