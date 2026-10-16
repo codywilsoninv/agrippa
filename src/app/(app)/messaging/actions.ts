@@ -86,7 +86,7 @@ export async function approveDraft(_prev: DecisionState, formData: FormData): Pr
       MODULE,
     );
     if (edited) await emitTelemetry(workspace.id, "messaging.draft_edited", { edit_size: size }, MODULE);
-    redirect("/messaging?done=copied");
+    redirect(`/messaging?done=copied&a=${draft.id}`);
   }
 
   const saved = await saveDraftNoteToCrm(workspace.id, payload, body, subject);

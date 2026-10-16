@@ -55,10 +55,18 @@ export async function listOpenDrafts(workspaceId: string): Promise<DraftRow[]> {
   const rows = (data ?? []) as Omit<DraftRow, "waiting_since">[];
   const since = await latestInbound(
     workspaceId,
-    rows.map((r) => r.payload.conversation_id).filter((id): id is string => Boolean(id)),
+    rows.flatMap((r) => conversationIdsOf(r.payload)),
   );
   return rows
-    .map((r) => ({ ...r, waiting_since: (r.payload.conversation_id && since.get(r.payload.conversation_id)) || r.proposed_at }))
+    .map((r) => ({
+      ...r,
+      waiting_since:
+        conversationIdsOf(r.payload)
+          .map((id) => since.get(id))
+          .filter((t): t is string => Boolean(t))
+          .sort()
+          .pop() || r.proposed_at,
+    }))
     .sort((a, b) => a.waiting_since.localeCompare(b.waiting_since));
 }
 
@@ -81,17 +89,41 @@ async function latestInbound(workspaceId: string, conversationIds: string[]): Pr
   return out;
 }
 
-export async function listThread(workspaceId: string, conversationId: string | null): Promise<MessageRow[]> {
-  if (!conversationId) return [];
+/** Every conversation a draft drew on (deal notes + texts), falling back to the single id. */
+export function conversationIdsOf(payload: DraftPayload): string[] {
+  const ids = payload.conversation_ids?.length ? payload.conversation_ids : payload.conversation_id ? [payload.conversation_id] : [];
+  return [...new Set(ids)];
+}
+
+export async function listThread(workspaceId: string, conversationIds: string[]): Promise<MessageRow[]> {
+  if (conversationIds.length === 0) return [];
   const supabase = await createClient();
   const { data } = await supabase
     .from("messages")
     .select("id, direction, channel, author, body, sent_at")
     .eq("workspace_id", workspaceId)
-    .eq("conversation_id", conversationId)
+    .in("conversation_id", conversationIds)
     .order("sent_at", { ascending: true })
     .limit(200);
   return (data ?? []) as MessageRow[];
+}
+
+/** A draft that was just dealt with, so the screen can show the final text (e.g. after "Copy and mark as sent"). */
+export async function loadDecidedDraft(workspaceId: string, actionId: string): Promise<{ body: string; subject: string | undefined; channel: "sms" | "email" } | null> {
+  if (!/^[0-9a-f-]{36}$/i.test(actionId)) return null;
+  const supabase = await createClient();
+  const { data } = await supabase
+    .from("actions")
+    .select("payload, edited_payload")
+    .eq("workspace_id", workspaceId)
+    .eq("module_id", "messaging")
+    .eq("kind", "draft_reply")
+    .eq("id", actionId)
+    .maybeSingle();
+  if (!data) return null;
+  const payload = data.payload as DraftPayload;
+  const edited = (data.edited_payload as DraftEdit | null) ?? null;
+  return { body: edited?.body ?? payload.body, subject: edited?.subject ?? payload.subject, channel: payload.channel };
 }
 
 export function finalText(row: DraftRow): { body: string; subject: string | undefined } {

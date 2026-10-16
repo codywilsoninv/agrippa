@@ -8,14 +8,14 @@ import { DraftDetail } from "@/components/draft-detail";
 import { SweepButton } from "@/components/sweep-button";
 import { longAge, formatDateTime } from "@/components/format";
 import { lastSweep } from "../sweep-info";
-import { listOpenDrafts, listThread, loadModuleState } from "./data";
+import { conversationIdsOf, listOpenDrafts, listThread, loadDecidedDraft, loadModuleState } from "./data";
 import { approveDraft, denyDraft, sweepNow } from "./actions";
 
 export const metadata = { title: "Messaging · Agrippa" };
 // The manual sweep runs as a server action on this page and can take minutes.
 export const maxDuration = 300;
 
-type Search = Promise<{ d?: string | string[]; done?: string | string[] }>;
+type Search = Promise<{ d?: string | string[]; done?: string | string[]; a?: string | string[] }>;
 
 export default async function MessagingPage({ searchParams }: { searchParams: Search }) {
   const { workspace } = await requireWorkspace();
@@ -23,6 +23,7 @@ export default async function MessagingPage({ searchParams }: { searchParams: Se
   const params = await searchParams;
   const wanted = Array.isArray(params.d) ? params.d[0] : params.d;
   const done = Array.isArray(params.done) ? params.done[0] : params.done;
+  const doneId = Array.isArray(params.a) ? params.a[0] : params.a;
 
   const [module, connections, drafts, sweep] = await Promise.all([
     loadModuleState(workspace.id),
@@ -57,7 +58,8 @@ export default async function MessagingPage({ searchParams }: { searchParams: Se
   }
 
   const selected = drafts.find((d) => d.id === wanted) ?? drafts[0] ?? null;
-  const thread = selected ? await listThread(workspace.id, selected.payload.conversation_id) : [];
+  const thread = selected ? await listThread(workspace.id, conversationIdsOf(selected.payload)) : [];
+  const copied = done === "copied" && doneId ? await loadDecidedDraft(workspace.id, doneId) : null;
   const oldest = drafts[0]?.waiting_since;
   const people = new Set(drafts.map((d) => d.payload.person_id ?? d.payload.job_id)).size;
 
@@ -76,7 +78,17 @@ export default async function MessagingPage({ searchParams }: { searchParams: Se
           </span>
         </div>
         {done === "approved" ? <Notice>Saved to Pipedrive.</Notice> : null}
-        {done === "copied" ? <Notice>Approved. Copy the text and send it from ClickSend.</Notice> : null}
+        {done === "copied" ? (
+          <Notice>
+            <span>Marked as sent. The text is on your clipboard; if it isn&apos;t, copy it from here and send it from ClickSend.</span>
+            {copied ? (
+              <pre className="m-0 mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded-sm bg-panel px-3 py-2 font-sans text-sm text-ink">
+                {copied.channel === "email" && copied.subject ? `Subject: ${copied.subject}\n\n` : ""}
+                {copied.body}
+              </pre>
+            ) : null}
+          </Notice>
+        ) : null}
         {done === "denied" ? <Notice>Draft denied.</Notice> : null}
         {drafts.length > 0 ? (
           <DraftList drafts={drafts} selectedId={selected?.id ?? null} />
@@ -125,8 +137,8 @@ function Empty({ title, children }: { title: string; children: React.ReactNode }
 
 function Notice({ children }: { children: React.ReactNode }) {
   return (
-    <p role="status" className="mx-6 my-0 rounded-sm bg-ok-soft px-3 py-2 text-sm text-ok">
+    <div role="status" className="mx-6 my-0 rounded-sm bg-ok-soft px-3 py-2 text-sm text-ok">
       {children}
-    </p>
+    </div>
   );
 }
