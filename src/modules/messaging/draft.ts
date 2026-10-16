@@ -36,8 +36,9 @@ export type DraftContext = {
 type Candidate = { personId: string; waiting: Waiting; deal: JobRow | null; contactJob: JobRow | null };
 
 /** Everyone who might be waiting: people touched by the refresh, plus people with an open enquiry in our pipeline. */
-export async function draftForWaiting(ctx: DraftContext, touched: string[], openEnquiryPeople: string[]): Promise<DraftReport> {
+export async function draftForWaiting(ctx: DraftContext, touched: string[], openEnquiryPeople: string[], opts: { maxDrafts?: number } = {}): Promise<DraftReport> {
   const { settings, store, nowIso } = ctx;
+  const maxDrafts = opts.maxDrafts ?? MAX_DRAFTS_PER_RUN;
   const report: DraftReport = { proposed: 0, skipped: 0, blocked: 0, errors: [], waiting: 0, incomplete: false };
   const people = [...new Set([...touched, ...openEnquiryPeople])];
 
@@ -50,7 +51,7 @@ export async function draftForWaiting(ctx: DraftContext, touched: string[], open
       const contactJob = jobs.find((j) => j.subtype === "contact" && j.status !== "merged") ?? null;
       const timeline = await store.timeline(personId);
       const waiting = computeWaiting(
-        timeline.map((m) => ({ direction: m.direction, channel: m.channel, at: m.sent_at })),
+        timeline.map((m) => ({ direction: m.direction, channel: m.channel, at: m.sent_at, kind: m.channel === "note" ? ("note" as const) : ("message" as const) })),
         deal ? dealContextOf(deal) : null,
         { nowIso, quietAfterHours: settings.crm.quiet_after_hours, newDealHours: NEW_DEAL_HOURS },
       );
@@ -64,7 +65,7 @@ export async function draftForWaiting(ctx: DraftContext, touched: string[], open
   // Newest inbound first, unreplied before new before quiet; capped so the run fits the window.
   const order: Record<Bucket, number> = { unreplied: 0, new: 1, quiet: 2 };
   candidates.sort((a, b) => order[a.waiting.bucket] - order[b.waiting.bucket] || t(b.waiting.lastInboundAt) - t(a.waiting.lastInboundAt));
-  const batch = candidates.slice(0, MAX_DRAFTS_PER_RUN);
+  const batch = candidates.slice(0, maxDrafts);
   if (candidates.length > batch.length) {
     report.incomplete = true;
     report.skipped += candidates.length - batch.length;

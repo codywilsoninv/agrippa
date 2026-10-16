@@ -66,20 +66,27 @@ function fail(what: string, error: { message: string } | null): never {
   throw new Error(`${what} (database error)`);
 }
 
-type PersonRow = { id: string; name: string; phone: string | null; email: string | null; custom: Record<string, unknown> };
+type PersonRow = { id: string; name: string; phone: string | null; email: string | null; custom: Record<string, unknown>; source_connection_id: string | null; source_external_id: string | null };
 
 function messagingOf(custom: unknown): Record<string, unknown> {
   const c = (custom && typeof custom === "object" ? custom : {}) as Record<string, unknown>;
   return (c.messaging && typeof c.messaging === "object" ? c.messaging : {}) as Record<string, unknown>;
 }
 
-function toKnown(row: PersonRow): KnownPerson {
+/** PostgREST filter values: quoted and escaped so a stray comma or bracket can't change the query. */
+function pgVal(v: string | number): string {
+  return `"${String(v).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+function toKnown(row: PersonRow, crmConnectionId: string): KnownPerson {
   const m = messagingOf(row.custom);
   const strs = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
+  // Rows from before custom.messaging existed carry the CRM id only in their source key.
+  const legacyId = row.source_connection_id === crmConnectionId && row.source_external_id && /^\d+$/.test(row.source_external_id) ? Number(row.source_external_id) : null;
   return {
     id: row.id,
     name: row.name,
-    pipedrive_id: typeof m.pipedrive_person_id === "number" ? m.pipedrive_person_id : null,
+    pipedrive_id: typeof m.pipedrive_person_id === "number" ? m.pipedrive_person_id : legacyId,
     phones: [...new Set([...(row.phone ? [row.phone] : []), ...strs(m.phones)])],
     emails: [...new Set([...(row.email ? [row.email] : []), ...strs(m.emails)])],
   };
@@ -90,22 +97,27 @@ export function createStore(workspaceId: string, crmConnectionId: string, db: Su
 
   // ---- People -------------------------------------------------------------
 
-  /** Every client Person that could be this contact (by CRM id, phone or email). */
+  /** Every client Person that could be this contact (by CRM id, phone or email), most recently touched first. */
   async function findPeople(q: { pipedrive_id?: number | null; phone?: string | null; email?: string | null }): Promise<KnownPerson[]> {
     const ors: string[] = [];
-    if (q.pipedrive_id) ors.push(`custom->messaging->>pipedrive_person_id.eq.${q.pipedrive_id}`);
-    if (q.phone) ors.push(`phone.eq.${q.phone}`, `custom->messaging->phones.cs.${JSON.stringify([q.phone])}`);
-    if (q.email) ors.push(`email.eq.${q.email}`, `custom->messaging->emails.cs.${JSON.stringify([q.email])}`);
+    if (q.pipedrive_id) {
+      ors.push(`custom->messaging->>pipedrive_person_id.eq.${pgVal(q.pipedrive_id)}`);
+      // Rows written before custom.messaging existed: matched by their source key.
+      ors.push(`and(source_connection_id.eq.${pgVal(crmConnectionId)},source_external_id.eq.${pgVal(String(q.pipedrive_id))})`);
+    }
+    if (q.phone) ors.push(`phone.eq.${pgVal(q.phone)}`, `custom->messaging->phones.cs.${pgVal(JSON.stringify([q.phone]))}`);
+    if (q.email) ors.push(`email.eq.${pgVal(q.email)}`, `custom->messaging->emails.cs.${pgVal(JSON.stringify([q.email]))}`);
     if (ors.length === 0) return [];
     const { data, error } = await db
       .from("people")
-      .select("id, name, phone, email, custom")
+      .select("id, name, phone, email, custom, source_connection_id, source_external_id")
       .eq("workspace_id", ws)
       .eq("kind", "external")
       .is("custom->messaging->>merged_into", null)
-      .or(ors.join(","));
+      .or(ors.join(","))
+      .order("updated_at", { ascending: false });
     if (error) fail("Couldn't look people up", error);
-    return ((data ?? []) as PersonRow[]).map(toKnown);
+    return ((data ?? []) as PersonRow[]).map((r) => toKnown(r, crmConnectionId));
   }
 
   async function createPerson(u: { name: string; pipedrive_id: number | null; phones: string[]; emails: string[] }): Promise<string> {
@@ -237,6 +249,7 @@ export function createStore(workspaceId: string, crmConnectionId: string, db: Su
       .eq("subtype", "enquiry")
       .eq("custom->messaging->>deal_status", "open")
       .eq("custom->messaging->>pipeline_id", String(pipelineId))
+      .neq("status", "merged")
       .not("client_person_id", "is", null)
       .order("updated_at", { ascending: false })
       .limit(limit);
@@ -438,6 +451,59 @@ export function createStore(workspaceId: string, crmConnectionId: string, db: Su
     if (error) fail("Couldn't save sync state", error);
   }
 
+  /**
+   * One refresh at a time per workspace: a marker on the CRM connection's
+   * sync_state. A marker older than the timeout is treated as a crashed run.
+   */
+  async function tryStartRun(connectionId: string, nowIso: string, timeoutMs: number): Promise<boolean> {
+    const { state } = await readSyncState(connectionId);
+    const since = typeof state.running_since === "string" ? new Date(state.running_since).getTime() : NaN;
+    if (Number.isFinite(since) && new Date(nowIso).getTime() - since < timeoutMs) return false;
+    const { error } = await db
+      .from("connections")
+      .update({ sync_state: { ...state, running_since: nowIso } })
+      .eq("workspace_id", ws)
+      .eq("id", connectionId);
+    if (error) fail("Couldn't mark the refresh as running", error);
+    return true;
+  }
+
+  async function endRun(connectionId: string): Promise<void> {
+    const { state } = await readSyncState(connectionId);
+    const { running_since: _drop, ...rest } = state;
+    void _drop;
+    await db.from("connections").update({ sync_state: rest }).eq("workspace_id", ws).eq("id", connectionId);
+  }
+
+  /**
+   * One-off reset: everything Messaging collected and drafted for this
+   * workspace. Rows the module created only; a person who is also a platform
+   * user (user_id set) is kept. Decided drafts (approved/executed/denied) stay
+   * for the audit trail; their payload keeps pointing at ids that no longer
+   * exist, which the screens tolerate. The sources are untouched.
+   */
+  async function resetMessagingData(): Promise<Record<string, number>> {
+    const counts: Record<string, number> = {};
+    const count = async (label: string, r: { data: unknown[] | null; error: { message: string } | null }, what: string) => {
+      if (r.error) fail(what, r.error);
+      counts[label] = r.data?.length ?? 0;
+    };
+    await count("drafts", await db.from("actions").delete().eq("workspace_id", ws).eq("module_id", MODULE_ID).in("status", ["proposed", "cancelled"]).select("id"), "Couldn't delete drafts");
+    const { data: convs, error: convError } = await db.from("conversations").select("id").eq("workspace_id", ws).eq("created_by_module", MODULE_ID);
+    if (convError) fail("Couldn't list conversations", convError);
+    const convIds = (convs ?? []).map((c) => c.id as string);
+    if (convIds.length > 0) {
+      await count("messages", await db.from("messages").delete().eq("workspace_id", ws).in("conversation_id", convIds).select("id"), "Couldn't delete messages");
+      await count("participants", await db.from("conversation_participants").delete().eq("workspace_id", ws).in("conversation_id", convIds).select("id"), "Couldn't delete participants");
+    }
+    await count("conversations", await db.from("conversations").delete().eq("workspace_id", ws).eq("created_by_module", MODULE_ID).select("id"), "Couldn't delete conversations");
+    await count("jobs", await db.from("jobs").delete().eq("workspace_id", ws).eq("created_by_module", MODULE_ID).select("id"), "Couldn't delete jobs");
+    await count("people", await db.from("people").delete().eq("workspace_id", ws).eq("created_by_module", MODULE_ID).is("user_id", null).select("id"), "Couldn't delete people (something still refers to one of them)");
+    const { error } = await db.from("connections").update({ sync_state: {}, last_synced_at: null }).eq("workspace_id", ws);
+    if (error) fail("Couldn't clear sync state", error);
+    return counts;
+  }
+
   /** People touched since a time (for the drafting step to look at). */
   async function peopleUpdatedSince(iso: string, limit = 200): Promise<string[]> {
     const { data, error } = await db
@@ -458,9 +524,9 @@ export function createStore(workspaceId: string, crmConnectionId: string, db: Su
   }
 
   async function personName(personId: string): Promise<KnownPerson | null> {
-    const { data, error } = await db.from("people").select("id, name, phone, email, custom").eq("workspace_id", ws).eq("id", personId).maybeSingle();
+    const { data, error } = await db.from("people").select("id, name, phone, email, custom, source_connection_id, source_external_id").eq("workspace_id", ws).eq("id", personId).maybeSingle();
     if (error) fail("Couldn't read person", error);
-    return data ? toKnown(data as PersonRow) : null;
+    return data ? toKnown(data as PersonRow, crmConnectionId) : null;
   }
 
   return {
@@ -482,6 +548,9 @@ export function createStore(workspaceId: string, crmConnectionId: string, db: Su
     replaceDraft,
     readSyncState,
     writeSyncState,
+    tryStartRun,
+    endRun,
+    resetMessagingData,
     peopleUpdatedSince,
     touchPerson,
   };

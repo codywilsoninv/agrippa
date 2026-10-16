@@ -75,9 +75,30 @@ export function parseAddressList(header: string | undefined): Address[] {
   return out;
 }
 
+/** Lower-cased, or null. Characters that would break a filter string (, ( ) ") are rejected outright. */
 export function normaliseEmail(address: string | null | undefined): string | null {
   const a = (address ?? "").trim().toLowerCase();
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(a) ? a : null;
+  if (/[,()"'\s]/.test(a)) return null;
+  return /^[^@]+@[^@]+\.[^@]+$/.test(a) ? a : null;
+}
+
+/**
+ * Which way an email went, given every address that is "us": our CRM users,
+ * every sender seen in the Sent folder, and addresses the business listed.
+ * `internal` means both ends are ours (staff mail), which is not a client thread.
+ */
+export function emailDirection(
+  from: string,
+  counterparts: string[],
+  ours: Set<string>,
+  sentFlag?: boolean | null,
+): { direction: "inbound" | "outbound"; counterpart: string | null; internal: boolean } {
+  const fromIsOurs = ours.has(from);
+  const direction: "inbound" | "outbound" = sentFlag === true || fromIsOurs ? "outbound" : "inbound";
+  const others = counterparts.filter((a) => !ours.has(a));
+  const counterpart = direction === "inbound" ? (fromIsOurs ? null : from) : (others[0] ?? null);
+  const internal = direction === "outbound" ? others.length === 0 : fromIsOurs;
+  return { direction, counterpart, internal };
 }
 
 // ---------------------------------------------------------------------------

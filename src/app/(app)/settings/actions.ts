@@ -8,7 +8,7 @@ import { testPipedrive } from "@/modules/messaging/pipedrive";
 import { testAcuity } from "@/modules/messaging/acuity";
 import { testClickSend } from "@/modules/messaging/clicksend";
 import { PROVIDERS } from "@/lib/providers";
-import { mergeSettings, validateSettings } from "@/modules/messaging/sweep";
+import { mergeSettings, resetMessagingData, validateSettings } from "@/modules/messaging/sweep";
 import { MODULE_ID, type MessagingSettings } from "@/modules/messaging/types";
 
 export type FormState = { ok?: string; error?: string; problems?: string[] } | null;
@@ -123,4 +123,19 @@ export async function saveSettings(_prev: FormState, formData: FormData): Promis
   if (error) return { error: "Couldn't save: " + error.message };
   await audit(workspace.id, "module.settings_saved", { actorUser: userId, objectType: "module", detail: { module_id: MODULE_ID } });
   return { ok: "Settings saved." };
+}
+
+// One-off reset of everything Messaging collected and drafted here. Admin only;
+// the page has its own confirm step. The connected apps are untouched.
+export async function resetMessaging(_prev: FormState, formData: FormData): Promise<FormState> {
+  const { userId, workspace, denied } = await requireAdmin();
+  if (denied) return { error: denied };
+  if (String(formData.get("confirm") ?? "") !== "RESET") return { error: "Type RESET to confirm." };
+  try {
+    const counts = await resetMessagingData(workspace.id, userId);
+    const parts = Object.entries(counts).map(([k, v]) => `${v} ${k}`);
+    return { ok: `Messaging data reset: ${parts.join(", ")} removed. Press Refresh on the Messaging page to start again.` };
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : "Couldn't reset." };
+  }
 }

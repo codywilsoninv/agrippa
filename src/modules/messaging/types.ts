@@ -78,8 +78,12 @@ export type MessagingSettings = {
     sms_inbound_prefix: string;
     /** Activity subject prefix the SMS integration logs for an outbound text. */
     sms_outbound_prefix: string;
-    /** Regex (case-insensitive) that marks a deal note as a chatbot transcript. */
+    /** Regex (case-insensitive) that marks a deal note as a chatbot transcript (the client's own words). */
     chatbot_note_pattern: string;
+    /** Regex (case-insensitive) that marks a deal note as a form submission (the client's own words). */
+    form_note_pattern: string;
+    /** Email addresses that are the business's own (besides its CRM users), so mail from them is ours. */
+    own_email_addresses: string[];
     /** E.164 numbers whose texts are never drafted for (staff, the business's own numbers). */
     ignore_phone_numbers: string[];
     /** Email senders (regex, case-insensitive, matched against the address) that are machines, not clients. */
@@ -115,6 +119,8 @@ export const DEFAULT_SETTINGS: MessagingSettings = {
     sms_inbound_prefix: "Received SMS from",
     sms_outbound_prefix: "SMS Sent to",
     chatbot_note_pattern: "chat|bot",
+    form_note_pattern: "jotform|form submission|enquiry form",
+    own_email_addresses: [],
     ignore_phone_numbers: [],
     email_skip_patterns: [
       "^(no-?reply|do-?not-?reply|donotreply|mailer-daemon|postmaster|bounce|notifications?|alerts?|calendar-notification|drive-shares)[@.+-]",

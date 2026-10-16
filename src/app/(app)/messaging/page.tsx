@@ -6,7 +6,7 @@ import { listConnections } from "@/lib/connections";
 import { DraftList } from "@/components/draft-list";
 import { DraftDetail } from "@/components/draft-detail";
 import { SweepButton } from "@/components/sweep-button";
-import { longAge, formatDateTime } from "@/components/format";
+import { longAge, formatDateTime, localeFor } from "@/components/format";
 import { lastSweep } from "../sweep-info";
 import { conversationIdsOf, listOpenDrafts, listThread, loadDecidedDraft, loadModuleState } from "./data";
 import { approveDraft, denyDraft, sweepNow } from "./actions";
@@ -100,7 +100,7 @@ export default async function MessagingPage({ searchParams }: { searchParams: Se
           </div>
         )}
         <div className="mt-auto px-6 pt-4">
-          <SweepButton action={sweepNow} lastRefreshed={sweep?.at ?? null} />
+          <SweepButton action={sweepNow} lastRefreshed={sweep?.at ?? null} timezone={module.settings.timezone} locale={localeFor(module.settings.country)} />
         </div>
       </section>
 

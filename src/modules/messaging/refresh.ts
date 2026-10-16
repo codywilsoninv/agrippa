@@ -11,7 +11,7 @@ import "server-only";
 import { getConnection, markConnectionError } from "@/lib/connections";
 import { ClickSendClient, type SmsRecord } from "./clicksend";
 import { placeholderName, resolvePerson, type Contact } from "./identity";
-import { isAutomatedSender, normaliseEmail, stripQuotedReply } from "./mail";
+import { emailDirection, isAutomatedSender, normaliseEmail, stripQuotedReply } from "./mail";
 import { samePhone, searchVariants, toE164 } from "./phone";
 import {
   PipedriveClient,
@@ -20,13 +20,15 @@ import {
   smsDirection,
   type PipedriveDeal,
   type PipedriveMailMessage,
+  type PipedriveNote,
   type PipedrivePerson,
 } from "./pipedrive";
 import { DRAFT_NOTE_RE } from "./settings";
 import { createStore, type MessageInput, type Store } from "./store";
+import { nextCursor } from "./sync";
 import { groupTexts } from "./texts";
 import type { MessagingSettings } from "./types";
-import { isDuplicateText } from "./waiting";
+import { classifyNote, isDuplicateText } from "./waiting";
 
 export type SourceReport = {
   provider: "pipedrive" | "clicksend";
@@ -45,6 +47,8 @@ export type RefreshReport = {
   touched: string[];
   /** True when a cap was hit and the next Refresh will pick up the rest. */
   incomplete: boolean;
+  /** True when this was the workspace's first ever refresh (drafting is capped lower). */
+  firstSync: boolean;
   durationMs: number;
 };
 
@@ -57,15 +61,32 @@ export type RefreshContext = {
   textsConnectionId: string | null;
   store: Store;
   nowIso: string;
+  /** Numbers ClickSend covered this run (the CRM's SMS log is skipped for them). */
+  coveredNumbers: Set<string>;
+  skipNames: Set<string>;
+  ignoredNumbers: Set<string>;
 };
 
 const FIRST_SYNC_DAYS = 30;
 /** Re-read a little before the cursor so a late-arriving record isn't missed. */
 const OVERLAP_MS = 5 * 60_000;
 const MAX_DEALS_PER_REFRESH = 60;
+const MAX_DEALS_FIRST_SYNC = 300;
+const MAX_NOTES_PER_REFRESH = 200;
+const MAX_ACTIVITIES_PER_REFRESH = 300;
 const MAX_MAIL_THREADS_PER_REFRESH = 40;
 const MAX_MAIL_THREADS_SCANNED = 300;
 const MAX_NEW_NUMBER_LOOKUPS = 30;
+/** A second Refresh pressed while one runs is refused; a marker older than this is a crashed run. */
+export const RUN_TIMEOUT_MS = 6 * 60_000;
+const CRM_THROTTLE_MS = 150;
+
+export class RefreshBusyError extends Error {
+  constructor() {
+    super("A refresh is already running. Give it a few minutes, then try again.");
+    this.name = "RefreshBusyError";
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Entry
@@ -80,18 +101,25 @@ export async function runRefresh(workspaceId: string, settings: MessagingSetting
   const clicksendConn = await getConnection(workspaceId, "clicksend");
   if (!clicksendConn) throw new Error("ClickSend isn't connected for this workspace. Texts can't be read without it.");
 
+  const store = createStore(workspaceId, pipedriveConn.id);
+  if (!(await store.tryStartRun(pipedriveConn.id, nowIso, RUN_TIMEOUT_MS))) throw new RefreshBusyError();
+  const firstSync = (await store.readSyncState(pipedriveConn.id)).last_synced_at === null;
+
   const ctx: RefreshContext = {
     workspaceId,
     settings,
-    crm: new PipedriveClient(pipedriveConn.secrets),
+    crm: new PipedriveClient(pipedriveConn.secrets, { throttleMs: CRM_THROTTLE_MS }),
     crmConnectionId: pipedriveConn.id,
     texts: new ClickSendClient(clicksendConn.secrets),
     textsConnectionId: clicksendConn.id,
-    store: createStore(workspaceId, pipedriveConn.id),
+    store,
     nowIso,
+    coveredNumbers: new Set(),
+    skipNames: new Set(settings.crm.skip_contact_names.map((n) => n.trim().toLowerCase())),
+    ignoredNumbers: new Set(settings.crm.ignore_phone_numbers.map((n) => toE164(n, settings.country)).filter((n): n is string => !!n)),
   };
   const resolver = createResolver(ctx);
-  const report: RefreshReport = { sources: [], touched: [], incomplete: false, durationMs: 0 };
+  const report: RefreshReport = { sources: [], touched: [], incomplete: false, firstSync, durationMs: 0 };
   const touched = new Set<string>();
 
   const run = async (label: SourceReport["label"], provider: SourceReport["provider"], fn: () => Promise<Partial<SourceReport> & { touched?: string[]; incomplete?: boolean }>) => {
@@ -108,11 +136,15 @@ export async function runRefresh(workspaceId: string, settings: MessagingSetting
     }
   };
 
-  // Order matters for text dedupe: ClickSend first, then the CRM's SMS log.
-  await run("Pipedrive", "pipedrive", () => syncDeals(ctx, resolver));
-  await run("ClickSend", "clicksend", () => syncClickSend(ctx, resolver));
-  await run("Pipedrive texts", "pipedrive", () => syncSmsActivities(ctx, resolver));
-  await run("Pipedrive email", "pipedrive", () => syncMailbox(ctx, resolver));
+  try {
+    // Order matters for text dedupe: ClickSend first, then the CRM's SMS log.
+    await run("Pipedrive", "pipedrive", () => syncDeals(ctx, resolver, firstSync));
+    await run("ClickSend", "clicksend", () => syncClickSend(ctx, resolver));
+    await run("Pipedrive texts", "pipedrive", () => syncSmsActivities(ctx, resolver));
+    await run("Email", "pipedrive", () => syncMailbox(ctx, resolver));
+  } finally {
+    await store.endRun(pipedriveConn.id);
+  }
 
   report.touched = [...touched];
   report.durationMs = Date.now() - started;
@@ -197,72 +229,154 @@ export function contactFromCrm(p: PipedrivePerson, country: string): Contact {
 // Cursors
 // ---------------------------------------------------------------------------
 
-async function cursor(store: Store, connectionId: string, key: string, nowIso: string): Promise<{ sinceIso: string; state: Record<string, unknown> }> {
+async function cursor(store: Store, connectionId: string, key: string, nowIso: string): Promise<{ sinceIso: string; previousIso: string | null; state: Record<string, unknown> }> {
   const { state } = await store.readSyncState(connectionId);
   const stored = typeof state[key] === "string" ? new Date(state[key] as string).getTime() : NaN;
+  const previousIso = Number.isFinite(stored) ? new Date(stored).toISOString() : null;
   const since = Number.isFinite(stored) ? stored - OVERLAP_MS : new Date(nowIso).getTime() - FIRST_SYNC_DAYS * 86_400_000;
-  return { sinceIso: new Date(since).toISOString(), state };
+  return { sinceIso: new Date(since).toISOString(), previousIso, state };
 }
 
-async function advance(store: Store, connectionId: string, state: Record<string, unknown>, key: string, nowIso: string, extra: Record<string, unknown> = {}): Promise<void> {
-  await store.writeSyncState(connectionId, { ...state, [key]: nowIso, ...extra }, nowIso);
+/** Move a cursor only as far as what was processed (sync.ts decides), and record counts. */
+async function advance(
+  store: Store,
+  connectionId: string,
+  key: string,
+  c: { previousIso: string | null; nowIso: string; skippedTimes: string[]; unlistedBeyond: boolean; oldestListedIso?: string | null },
+  extra: Record<string, unknown> = {},
+): Promise<boolean> {
+  const { cursorIso, incomplete } = nextCursor(c);
+  // Re-read the state: another source may have written its own key meanwhile.
+  const { state } = await store.readSyncState(connectionId);
+  await store.writeSyncState(connectionId, { ...state, [key]: cursorIso, ...extra }, c.nowIso);
+  return incomplete;
 }
 
 // ---------------------------------------------------------------------------
 // Source: Pipedrive deals, persons, notes
 // ---------------------------------------------------------------------------
 
-async function syncDeals(ctx: RefreshContext, resolver: Resolver) {
+async function syncDeals(ctx: RefreshContext, resolver: Resolver, firstSync: boolean) {
   const { crm, store, settings, nowIso, crmConnectionId } = ctx;
-  const { sinceIso, state } = await cursor(store, crmConnectionId, "deals", nowIso);
+  const { sinceIso, previousIso } = await cursor(store, crmConnectionId, "deals", nowIso);
   const since = new Date(sinceIso).getTime();
-  const stageById = new Map(settings.crm.stages.map((s) => [s.id, s]));
-  const skipNames = new Set(settings.crm.skip_contact_names.map((n) => n.trim().toLowerCase()));
 
-  const deals = (await crm.listOpenDeals(settings.crm.pipeline_id))
-    .filter((d) => d.person_id && pipedriveTime(d.update_time).getTime() >= since)
-    .sort((a, b) => pipedriveTime(b.update_time).getTime() - pipedriveTime(a.update_time).getTime());
-  const batch = deals.slice(0, MAX_DEALS_PER_REFRESH);
+  // First sync: every open deal in the pipeline, whatever its age. After that:
+  // every deal changed since the cursor, any status, so won/lost moves land.
+  const deals = firstSync
+    ? (await crm.listOpenDeals(settings.crm.pipeline_id)).slice(0, MAX_DEALS_FIRST_SYNC)
+    : await crm.listDealsUpdated(settings.crm.pipeline_id, sinceIso, MAX_DEALS_PER_REFRESH + 1);
+  const withPerson = deals.filter((d) => d.person_id).sort((a, b) => pipedriveTime(b.update_time).getTime() - pipedriveTime(a.update_time).getTime());
+  const batch = withPerson.slice(0, MAX_DEALS_PER_REFRESH);
+  const skippedTimes = withPerson.slice(MAX_DEALS_PER_REFRESH).map((d) => pipedriveTime(d.update_time).toISOString());
 
   const touched: string[] = [];
   let fresh = 0;
+  const knownDeals = new Map<number, { personId: string; deal: PipedriveDeal }>();
   for (const deal of batch) {
-    const person = await resolver.crmPerson(deal.person_id!);
-    if (!person || skipNames.has(person.name.trim().toLowerCase())) continue;
-    const personId = await resolver.resolve(contactFromCrm(person, settings.country));
-    const stage = stageById.get(deal.stage_id) ?? null;
-    await store.upsertJob({
-      external_id: String(deal.id),
-      subtype: "enquiry",
-      title: deal.title,
-      status: deal.status,
-      client_person_id: personId,
-      messaging: dealContext(deal, stage?.name ?? null, stage?.treat_as ?? null, crm.dealUrl(deal.id)),
-    });
-    const notes = (await crm.getDealNotes(deal.id)).filter((n) => !DRAFT_NOTE_RE.test(noteToText(n.content)));
-    const conv = await store.ensureConversation(personId, "crm", `Enquiry notes: ${person.name}`);
-    const added = await store.addMessages(
-      conv,
-      notes
-        .map((n) => ({
-          source_connection_id: crmConnectionId,
-          external_id: `note:${n.id}`,
-          direction: "inbound" as const,
-          channel: "note" as const,
-          author: null,
-          body: noteToText(n.content),
-          sent_at: pipedriveTime(n.add_time).toISOString(),
-        }))
-        .filter((m) => m.body.length > 0),
-    );
+    const filed = await fileDeal(ctx, resolver, deal);
+    if (!filed) continue;
+    knownDeals.set(deal.id, filed);
+    const added = await fileNotes(ctx, filed.personId, deal, await crm.getDealNotes(deal.id));
     if (added > 0 || pipedriveTime(deal.add_time).getTime() >= since) {
       fresh += 1;
-      touched.push(personId);
-      await store.touchPerson(personId);
+      touched.push(filed.personId);
+      await store.touchPerson(filed.personId);
     }
   }
-  await advance(store, crmConnectionId, state, "deals", nowIso, { deals_seen: deals.length });
-  return { new: fresh, touched, incomplete: deals.length > batch.length };
+
+  // Adding a note doesn't reliably bump the deal's update_time, so notes get
+  // their own pass: anything written since the cursor, on deals we may not
+  // have seen above.
+  let notesIncomplete = false;
+  if (!firstSync) {
+    const notes = (await crm.listNotesSince(sinceIso, MAX_NOTES_PER_REFRESH + 1)).filter((n) => n.deal_id && !DRAFT_NOTE_RE.test(noteToText(n.content)));
+    notesIncomplete = notes.length > MAX_NOTES_PER_REFRESH;
+    const byDeal = new Map<number, PipedriveNote[]>();
+    for (const n of notes.slice(0, MAX_NOTES_PER_REFRESH)) byDeal.set(n.deal_id!, [...(byDeal.get(n.deal_id!) ?? []), n]);
+    for (const [dealId, list] of byDeal) {
+      let known = knownDeals.get(dealId);
+      if (!known) {
+        const deal = await crm.getDeal(dealId);
+        if (!deal || deal.pipeline_id !== settings.crm.pipeline_id || !deal.person_id) continue;
+        const filed = await fileDeal(ctx, resolver, deal);
+        if (!filed) continue;
+        known = filed;
+        knownDeals.set(dealId, filed);
+      }
+      // Classification needs the deal's first note, so read the deal's notes once.
+      const added = await fileNotes(ctx, known.personId, known.deal, await crm.getDealNotes(dealId), new Set(list.map((n) => n.id)));
+      if (added > 0) {
+        fresh += 1;
+        touched.push(known.personId);
+        await store.touchPerson(known.personId);
+      }
+    }
+  }
+
+  const incomplete = await advance(store, crmConnectionId, "deals", { previousIso, nowIso, skippedTimes, unlistedBeyond: notesIncomplete, oldestListedIso: sinceIso }, { deals_seen: withPerson.length });
+  return { new: fresh, touched, incomplete };
+}
+
+/** The deal's job and its person. Null when the person is unknown or on the skip list. */
+async function fileDeal(ctx: RefreshContext, resolver: Resolver, deal: PipedriveDeal): Promise<{ personId: string; deal: PipedriveDeal } | null> {
+  const { store, settings, crm } = ctx;
+  const stageById = new Map(settings.crm.stages.map((s) => [s.id, s]));
+  const person = await resolver.crmPerson(deal.person_id!);
+  if (!person || ctx.skipNames.has(person.name.trim().toLowerCase())) return null;
+  const personId = await resolver.resolve(contactFromCrm(person, settings.country));
+  const stage = stageById.get(deal.stage_id) ?? null;
+  await store.upsertJob({
+    external_id: String(deal.id),
+    subtype: "enquiry",
+    title: deal.title,
+    status: deal.status,
+    client_person_id: personId,
+    messaging: dealContext(deal, stage?.name ?? null, stage?.treat_as ?? null, crm.dealUrl(deal.id)),
+  });
+  return { personId, deal };
+}
+
+/**
+ * A deal's notes into the person's CRM conversation. The client's own words
+ * (chatbot transcript, form submission, the first note right after the deal
+ * was made) are inbound messages; everything else is an internal note that
+ * counts neither as the client writing nor as our reply.
+ */
+async function fileNotes(ctx: RefreshContext, personId: string, deal: PipedriveDeal, allNotes: PipedriveNote[], only?: Set<number>): Promise<number> {
+  const { store, settings, crmConnectionId } = ctx;
+  const notes = allNotes.filter((n) => !DRAFT_NOTE_RE.test(noteToText(n.content))).sort((a, b) => pipedriveTime(a.add_time).getTime() - pipedriveTime(b.add_time).getTime());
+  const firstNoteAt = notes[0] ? pipedriveTime(notes[0].add_time).toISOString() : null;
+  const dealCreated = pipedriveTime(deal.add_time).toISOString();
+  const conv = await store.ensureConversation(personId, "crm", "Enquiry notes");
+  const rows: MessageInput[] = [];
+  for (const n of notes) {
+    if (only && !only.has(n.id)) continue;
+    const body = noteToText(n.content);
+    if (!body) continue;
+    const at = pipedriveTime(n.add_time).toISOString();
+    const kind = classifyNote({ body, at }, { created_at: dealCreated, firstNoteAt }, { chatbot: settings.crm.chatbot_note_pattern, form: settings.crm.form_note_pattern });
+    const chatbot = kind === "message" && safeTest(settings.crm.chatbot_note_pattern, body.slice(0, 300));
+    rows.push({
+      source_connection_id: crmConnectionId,
+      external_id: `note:${n.id}`,
+      direction: "inbound",
+      // 'note' = internal CRM note (ignored by the waiting rules); client words are 'chat' or 'form'.
+      channel: kind === "note" ? "note" : chatbot ? "chat" : "form",
+      author: null,
+      body,
+      sent_at: at,
+    });
+  }
+  return store.addMessages(conv, rows);
+}
+
+function safeTest(pattern: string, text: string): boolean {
+  try {
+    return new RegExp(pattern, "i").test(text);
+  } catch {
+    return false;
+  }
 }
 
 /** What a job remembers about its deal: context for drafting, never a gate. */
@@ -286,27 +400,31 @@ export function dealContext(deal: PipedriveDeal, stageName: string | null, treat
 async function syncClickSend(ctx: RefreshContext, resolver: Resolver) {
   const { texts, textsConnectionId, store, settings, nowIso } = ctx;
   if (!texts || !textsConnectionId) return { new: 0, note: "ClickSend isn't connected." };
-  const { sinceIso, state } = await cursor(store, textsConnectionId, "texts", nowIso);
+  const { sinceIso, previousIso } = await cursor(store, textsConnectionId, "texts", nowIso);
   const sinceUnix = Math.floor(new Date(sinceIso).getTime() / 1000);
   const [inbound, sent] = await Promise.all([texts.listInbound(sinceUnix), texts.listSent(sinceUnix)]);
   const threads = groupTexts([...inbound, ...sent], settings.country, settings.crm.ignore_phone_numbers);
 
   const touched: string[] = [];
+  const skippedTimes: string[] = [];
   let fresh = 0;
-  let incomplete = false;
   for (const t of threads) {
     const known = await store.findPeople({ phone: t.phone });
     let contact: Contact = { phone: t.phone };
+    let crmPerson: PipedrivePerson | null = null;
     if (known.length === 0) {
       // A number we've never seen: ask the CRM who it is (bounded per refresh).
       if (resolver.lookupsLeft() <= 0) {
-        incomplete = true;
+        skippedTimes.push(...t.texts.map((x) => x.at));
         continue;
       }
-      const crmPerson = await resolver.crmPersonByPhone(t.phone);
+      crmPerson = await resolver.crmPersonByPhone(t.phone);
       if (crmPerson) contact = { ...contactFromCrm(crmPerson, settings.country), phone: t.phone };
     }
+    const name = crmPerson?.name ?? known[0]?.name ?? "";
+    if (name && ctx.skipNames.has(name.trim().toLowerCase())) continue;
     const personId = await resolver.resolve(contact);
+    ctx.coveredNumbers.add(t.phone);
     const added = await fileTexts(store, personId, t.texts, textsConnectionId, "clicksend");
     if (added > 0) {
       fresh += added;
@@ -314,7 +432,7 @@ async function syncClickSend(ctx: RefreshContext, resolver: Resolver) {
       await store.touchPerson(personId);
     }
   }
-  await advance(store, textsConnectionId, state, "texts", nowIso, { threads_seen: threads.length });
+  const incomplete = await advance(store, textsConnectionId, "texts", { previousIso, nowIso, skippedTimes, unlistedBeyond: false }, { threads_seen: threads.length });
   return { new: fresh, touched, incomplete };
 }
 
@@ -347,9 +465,11 @@ async function fileTexts(store: Store, personId: string, texts: SmsRecord[], con
 
 async function syncSmsActivities(ctx: RefreshContext, resolver: Resolver) {
   const { crm, store, settings, nowIso, crmConnectionId } = ctx;
-  const { sinceIso, state } = await cursor(store, crmConnectionId, "sms_activities", nowIso);
-  const activities = (await crm.listRecentActivities(300, sinceIso)).filter((a) => a.person_id && smsDirection(a, settings.crm));
-  const ignored = new Set(settings.crm.ignore_phone_numbers.map((n) => toE164(n, settings.country)));
+  const { sinceIso, previousIso } = await cursor(store, crmConnectionId, "sms_activities", nowIso);
+  const all = await crm.listRecentActivities(MAX_ACTIVITIES_PER_REFRESH, sinceIso);
+  const unlistedBeyond = all.length >= MAX_ACTIVITIES_PER_REFRESH;
+  const oldestListed = all.length > 0 ? pipedriveTime(all[all.length - 1].update_time).toISOString() : null;
+  const activities = all.filter((a) => a.person_id && smsDirection(a, settings.crm));
 
   const byPerson = new Map<number, SmsRecord[]>();
   for (const a of activities) {
@@ -365,9 +485,11 @@ async function syncSmsActivities(ctx: RefreshContext, resolver: Resolver) {
   let fresh = 0;
   for (const [pid, list] of byPerson) {
     const person = await resolver.crmPerson(pid);
-    if (!person) continue;
+    if (!person || ctx.skipNames.has(person.name.trim().toLowerCase())) continue;
     const contact = contactFromCrm(person, settings.country);
-    if (contact.phone && ignored.has(contact.phone)) continue;
+    if (contact.phone && ctx.ignoredNumbers.has(contact.phone)) continue;
+    // ClickSend already filed this number's texts this run: the CRM's copy would only duplicate them.
+    if (contact.phone && ctx.coveredNumbers.has(contact.phone)) continue;
     const personId = await resolver.resolve(contact);
     list.sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
     const added = await fileTexts(store, personId, list, crmConnectionId, "activity");
@@ -377,8 +499,8 @@ async function syncSmsActivities(ctx: RefreshContext, resolver: Resolver) {
       await store.touchPerson(personId);
     }
   }
-  await advance(store, crmConnectionId, state, "sms_activities", nowIso);
-  return { new: fresh, touched };
+  const incomplete = await advance(store, crmConnectionId, "sms_activities", { previousIso, nowIso, skippedTimes: [], unlistedBeyond, oldestListedIso: oldestListed });
+  return { new: fresh, touched, incomplete };
 }
 
 // ---------------------------------------------------------------------------
@@ -386,30 +508,43 @@ async function syncSmsActivities(ctx: RefreshContext, resolver: Resolver) {
 // ---------------------------------------------------------------------------
 
 async function syncMailbox(ctx: RefreshContext, resolver: Resolver) {
-  const { crm, store, nowIso, crmConnectionId } = ctx;
-  const { sinceIso, state } = await cursor(store, crmConnectionId, "mail", nowIso);
+  const { crm, store, settings, nowIso, crmConnectionId } = ctx;
+  const { sinceIso, previousIso } = await cursor(store, crmConnectionId, "mail", nowIso);
   const since = new Date(sinceIso).getTime();
-  const me = await crm.myEmail();
 
   const [inbox, sent] = await Promise.all([crm.listMailThreads("inbox", MAX_MAIL_THREADS_SCANNED), crm.listMailThreads("sent", MAX_MAIL_THREADS_SCANNED)]);
   if (inbox.length === 0 && sent.length === 0) {
-    await advance(store, crmConnectionId, state, "mail", nowIso);
+    await advance(store, crmConnectionId, "mail", { previousIso, nowIso, skippedTimes: [], unlistedBeyond: false });
     return { new: 0, note: "No synced email found for this Pipedrive user (the Mailbox API shows the API token owner's Sales Inbox)." };
   }
+  // "Us": every CRM user, every sender in the Sent folder, and what the business listed.
+  const ours = new Set<string>([...(await crm.listUserEmails()), ...settings.crm.own_email_addresses]);
+  for (const t of sent) for (const p of t.parties.from) {
+    const a = normaliseEmail(p.email_address);
+    if (a) ours.add(a);
+  }
+
   const seen = new Set<number>();
   const changed = [...inbox, ...sent]
     .filter((t) => (seen.has(t.id) ? false : (seen.add(t.id), true)))
     .filter((t) => new Date(t.last_message_at).getTime() >= since)
     .sort((a, b) => new Date(b.last_message_at).getTime() - new Date(a.last_message_at).getTime());
   const batch = changed.slice(0, MAX_MAIL_THREADS_PER_REFRESH);
+  const skippedTimes = changed.slice(MAX_MAIL_THREADS_PER_REFRESH).map((t) => t.last_message_at);
+  const scanCapped = inbox.length >= MAX_MAIL_THREADS_SCANNED || sent.length >= MAX_MAIL_THREADS_SCANNED;
+  const oldestScanned = [...inbox, ...sent].map((t) => t.last_message_at).sort()[0] ?? null;
 
   const touched: string[] = [];
   let fresh = 0;
-  // Concurrency 1: each thread read costs 20 API tokens and rate limits bite.
+  let dropped = 0;
+  // One thread at a time: each read costs 20 API tokens and rate limits bite.
   for (const thread of batch) {
-    const messages = await crm.getMailMessages(thread.id);
-    for (const m of messages) {
-      const filed = await fileMail(ctx, resolver, m, me);
+    for (const m of await crm.getMailMessages(thread.id)) {
+      if (!m.body_html) {
+        dropped += 1;
+        continue;
+      }
+      const filed = await fileMail(ctx, resolver, m, ours);
       if (filed) {
         fresh += 1;
         touched.push(filed);
@@ -417,31 +552,32 @@ async function syncMailbox(ctx: RefreshContext, resolver: Resolver) {
     }
   }
   for (const id of new Set(touched)) await store.touchPerson(id);
-  await advance(store, crmConnectionId, state, "mail", nowIso, { mail_threads_seen: changed.length });
-  return { new: fresh, touched, incomplete: changed.length > batch.length };
+  const incomplete = await advance(store, crmConnectionId, "mail", { previousIso, nowIso, skippedTimes, unlistedBeyond: scanCapped, oldestListedIso: oldestScanned }, { mail_threads_seen: changed.length });
+  return { new: fresh, touched, incomplete, note: dropped > 0 ? `${dropped} email${dropped === 1 ? "" : "s"} had no readable body and ${dropped === 1 ? "was" : "were"} skipped.` : undefined };
 }
 
 /** One synced email into its person's email conversation. Returns the person id when it was new. */
-async function fileMail(ctx: RefreshContext, resolver: Resolver, m: PipedriveMailMessage, me: string | null): Promise<string | null> {
+async function fileMail(ctx: RefreshContext, resolver: Resolver, m: PipedriveMailMessage, ours: Set<string>): Promise<string | null> {
   const { store, settings, crmConnectionId } = ctx;
-  const from = m.from[0];
-  const fromAddress = normaliseEmail(from?.email_address);
+  const fromAddress = normaliseEmail(m.from[0]?.email_address);
   if (!fromAddress) return null;
-  const direction: "inbound" | "outbound" = me && fromAddress === me ? "outbound" : "inbound";
-  const other = direction === "inbound" ? from : (m.to.find((p) => normaliseEmail(p.email_address) !== me) ?? m.to[0]);
-  const otherAddress = normaliseEmail(other?.email_address);
-  if (!otherAddress) return null;
-  if (direction === "inbound" && isAutomatedSender(otherAddress, {}, settings.crm.email_skip_patterns)) return null;
+  const counterparts = [...m.to, ...m.cc].map((p) => normaliseEmail(p.email_address)).filter((a): a is string => !!a);
+  const { direction, counterpart, internal } = emailDirection(fromAddress, counterparts, ours, m.sent_flag);
+  if (internal || !counterpart) return null; // staff mail, or nobody on the other end
+  if (direction === "inbound" && isAutomatedSender(counterpart, {}, settings.crm.email_skip_patterns)) return null;
 
   const body = stripQuotedReply(noteToText(m.body_html));
   if (!body) return null;
 
-  // Identity: the CRM's own link first, then the address.
-  let contact: Contact = { email: otherAddress, name: other?.name ?? null };
-  if (other?.linked_person_id) {
-    const person = await resolver.crmPerson(other.linked_person_id);
-    if (person) contact = { ...contactFromCrm(person, settings.country), email: otherAddress };
+  // Identity: the CRM's own link first, then the address. Never a Person for one of our own addresses.
+  const party = direction === "inbound" ? m.from[0] : [...m.to, ...m.cc].find((p) => normaliseEmail(p.email_address) === counterpart);
+  let contact: Contact = { email: counterpart, name: party?.name ?? null };
+  if (party?.linked_person_id) {
+    const person = await resolver.crmPerson(party.linked_person_id);
+    if (person) contact = { ...contactFromCrm(person, settings.country), email: counterpart };
   }
+  const name = contact.name ?? "";
+  if (name && ctx.skipNames.has(name.trim().toLowerCase())) return null;
   const personId = await resolver.resolve(contact);
   const conv = await store.ensureConversation(personId, "email", "Email");
   const added = await store.addMessages(conv, [
@@ -450,7 +586,7 @@ async function fileMail(ctx: RefreshContext, resolver: Resolver, m: PipedriveMai
       external_id: `mail:${m.id}`,
       direction,
       channel: "email",
-      author: direction === "inbound" ? (other?.name ?? null) : null,
+      author: direction === "inbound" ? (party?.name ?? null) : null,
       body: m.subject ? `Subject: ${m.subject}\n\n${body}` : body,
       sent_at: m.at,
     },

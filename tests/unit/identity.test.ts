@@ -87,9 +87,9 @@ test("computeWaiting: a stage the business opted out of is never waiting, even w
   assert.equal(computeWaiting(tl, { status: "open", treat_as: "ignore", created_at: "2026-10-16T00:00:00Z" }, opts), null);
 });
 
-test("isDuplicateText: same body, same direction, within two minutes", () => {
+test("isDuplicateText: same body, same direction, within thirty minutes", () => {
   const existing = [{ body: "See you Wed!", at: "2026-10-16T00:00:00Z", direction: "outbound" as const }];
-  assert.equal(isDuplicateText(existing, { body: "see you wed! ", at: "2026-10-16T00:01:30Z", direction: "outbound" }), true);
-  assert.equal(isDuplicateText(existing, { body: "See you Wed!", at: "2026-10-16T00:05:00Z", direction: "outbound" }), false);
+  assert.equal(isDuplicateText(existing, { body: "see you wed! ", at: "2026-10-16T00:25:00Z", direction: "outbound" }), true);
+  assert.equal(isDuplicateText(existing, { body: "See you Wed!", at: "2026-10-16T00:45:00Z", direction: "outbound" }), false);
   assert.equal(isDuplicateText(existing, { body: "See you Wed!", at: "2026-10-16T00:00:30Z", direction: "inbound" }), false);
 });

@@ -11,9 +11,11 @@ import { audit, emitTelemetry } from "@/lib/telemetry";
 import { AcuityClient } from "./acuity";
 import { draftForWaiting } from "./draft";
 import { PipedriveClient } from "./pipedrive";
-import { runRefresh, type SourceReport } from "./refresh";
+import { RefreshBusyError, runRefresh, type SourceReport } from "./refresh";
+
+export { RefreshBusyError };
 import { draftNoteHeading, mergeSettings, validateSettings } from "./settings";
-import { readModuleSettings } from "./store";
+import { createStore, readModuleSettings } from "./store";
 import { MODULE_ID, MODULE_VERSION, type DraftPayload, type MessagingSettings } from "./types";
 
 export { mergeSettings, validateSettings, draftNoteHeading };
@@ -31,6 +33,9 @@ export type SweepReport = {
   /** True when a cap was hit: press Refresh again to pick up the rest. */
   incomplete: boolean;
   refreshedAt: string;
+  /** For formatting times on screen. */
+  timezone: string;
+  firstSync: boolean;
 };
 
 const TELEMETRY_MODULE = { id: MODULE_ID, version: MODULE_VERSION };
@@ -55,10 +60,12 @@ export async function runSweep(workspaceId: string, opts: { trigger: "manual" | 
   // 2. Draft for people who are waiting.
   const acuityConn = await getConnection(workspaceId, "acuity");
   const openPeople = await refresh.ctx.store.openEnquiryPeople(settings.crm.pipeline_id);
+  // A first sync can surface a month of backlog: draft a few, let the person look, press again.
   const drafts = await draftForWaiting(
     { workspaceId, settings, crm: refresh.ctx.crm, store: refresh.ctx.store, acuity: acuityConn ? new AcuityClient(acuityConn.secrets) : null, sweepId, nowIso: refresh.ctx.nowIso },
     refresh.touched,
     openPeople,
+    { maxDrafts: refresh.firstSync ? 10 : undefined },
   );
 
   const report: SweepReport = {
@@ -71,6 +78,8 @@ export async function runSweep(workspaceId: string, opts: { trigger: "manual" | 
     waiting: drafts.waiting,
     incomplete: refresh.incomplete || drafts.incomplete,
     refreshedAt: refresh.ctx.nowIso,
+    timezone: settings.timezone,
+    firstSync: refresh.firstSync,
   };
 
   const counts = {
@@ -82,6 +91,7 @@ export async function runSweep(workspaceId: string, opts: { trigger: "manual" | 
     errors: report.errors.length,
     incomplete: report.incomplete,
     duration_ms: report.durationMs,
+    first_sync: refresh.firstSync,
     ...Object.fromEntries(report.sources.map((s) => [`new_${s.label.toLowerCase().replace(/\W+/g, "_")}`, s.new])),
   };
   await emitTelemetry(workspaceId, "messaging.sweep", counts, TELEMETRY_MODULE);
@@ -109,4 +119,18 @@ export async function saveDraftNoteToCrm(
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "Couldn't save the note to Pipedrive." };
   }
+}
+
+// ---------------------------------------------------------------------------
+// One-off reset of everything Messaging collected (admin-only, from Settings)
+// ---------------------------------------------------------------------------
+
+export async function resetMessagingData(workspaceId: string, actorUser: string): Promise<Record<string, number>> {
+  const pipedriveConn = await getConnection(workspaceId, "pipedrive");
+  // The store needs a CRM connection id only as the key for new rows; deleting doesn't.
+  const store = createStore(workspaceId, pipedriveConn?.id ?? "00000000-0000-0000-0000-000000000000");
+  const counts = await store.resetMessagingData();
+  await audit(workspaceId, "messaging.reset", { actorUser, actorModule: MODULE_ID, objectType: "module", detail: counts });
+  await emitTelemetry(workspaceId, "messaging.reset", counts, TELEMETRY_MODULE);
+  return counts;
 }

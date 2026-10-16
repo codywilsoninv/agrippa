@@ -9,10 +9,38 @@ import type { Bucket, CrmStage } from "./types";
 
 export type TimelineItem = {
   direction: "inbound" | "outbound";
-  /** 'note' = a CRM note (form summary, chatbot transcript): the enquiry itself. */
   channel: "sms" | "email" | "chat" | "form" | "note";
   at: string; // ISO
+  /**
+   * 'message': something a person wrote to the other side.
+   * 'note': an internal CRM note (staff remark, system log). Context only: it
+   * is neither a client message nor our reply.
+   */
+  kind?: "message" | "note";
 };
+
+/**
+ * Is a CRM note the client's own words (a chatbot transcript, a form
+ * submission, the enquiry text)? Then it counts as inbound. Anything else is
+ * an internal note.
+ */
+export function classifyNote(
+  note: { body: string; at: string },
+  deal: { created_at: string; firstNoteAt: string | null },
+  patterns: { chatbot: string; form: string },
+): "message" | "note" {
+  const head = note.body.slice(0, 300);
+  for (const p of [patterns.chatbot, patterns.form]) {
+    try {
+      if (p && new RegExp(p, "i").test(head)) return "message";
+    } catch {
+      // bad pattern: validateSettings reports it
+    }
+  }
+  // The deal's first note, written within 30 minutes of the deal itself, is the enquiry.
+  if (deal.firstNoteAt && t(note.at) === t(deal.firstNoteAt) && Math.abs(t(note.at) - t(deal.created_at)) <= 30 * 60_000) return "message";
+  return "note";
+}
 
 export type DealContext = {
   status: "open" | "won" | "lost";
@@ -39,7 +67,7 @@ export type WaitingOptions = {
 export function computeWaiting(timeline: TimelineItem[], deal: DealContext | null, opts: WaitingOptions): Waiting | null {
   if (deal?.treat_as === "ignore") return null;
 
-  const sorted = [...timeline].sort((a, b) => t(a.at) - t(b.at));
+  const sorted = timeline.filter((m) => (m.kind ?? "message") === "message").sort((a, b) => t(a.at) - t(b.at));
   const lastInbound = [...sorted].reverse().find((m) => m.direction === "inbound") ?? null;
   const lastOutbound = [...sorted].reverse().find((m) => m.direction === "outbound") ?? null;
   const base = {
@@ -75,7 +103,7 @@ function t(iso: string): number {
 export function isDuplicateText(
   existing: { body: string; at: string; direction: "inbound" | "outbound" }[],
   candidate: { body: string; at: string; direction: "inbound" | "outbound" },
-  windowMs = 2 * 60_000,
+  windowMs = 30 * 60_000,
 ): boolean {
   const norm = (s: string) => s.replace(/\s+/g, " ").trim().toLowerCase();
   const b = norm(candidate.body);
