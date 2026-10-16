@@ -232,6 +232,8 @@ export type DraftInput = {
   /** sms when the thread has run over text, else email. */
   channelHint: "sms" | "email";
   nowIso: string;
+  /** What the CRM knows about this client's deal, for context. Null = no deal on file. */
+  crmContext?: { title: string; status: "open" | "won" | "lost"; stage_name: string | null; treat_as: "new" | "follow_up" | "booked" | "ignore" | null } | null;
 };
 
 export async function draftReply(workspaceId: string, input: DraftInput): Promise<DraftResult> {
@@ -290,6 +292,7 @@ function renderDraftRequest(input: DraftInput): string {
     `SIGNS OFF AS: ${settings.sender_name}`,
     `TIMEZONE: ${tz}. Current local time: ${formatSlot(input.nowIso, tz)}.`,
     `SITUATION: ${bucketNote[input.bucket]}`,
+    `CRM: ${renderCrmContext(input.crmContext)}`,
     `CHANNEL: ${input.channelHint === "sms" ? "Reply by text (the thread runs over SMS)." : `Reply by email. Subject line is fixed: "${settings.email_subject}".`}`,
     "",
     "VOICE (how this business writes):",
@@ -320,6 +323,16 @@ function renderDraftRequest(input: DraftInput): string {
     "THREAD:",
     renderThread(input.thread, tz),
   ].join("\n");
+}
+
+function renderCrmContext(c: DraftInput["crmContext"]): string {
+  if (c === undefined) return "no information.";
+  if (c === null) return "no deal on file for this number. We don't know who this is beyond the thread; say so in flags and don't assume what they've booked.";
+  const booked = c.status === "won" || c.treat_as === "booked";
+  const where = `deal "${c.title}", status ${c.status}${c.stage_name ? `, stage "${c.stage_name}"` : ""}`;
+  if (booked) return `${where}. THIS CLIENT IS ALREADY BOOKED. Do not re-quote or offer new dates unless they ask. If they ask something you can't see here (their appointment time, what to bring, deposit status), say you'll confirm and come back, and put the question in flags for the approver.`;
+  if (c.status === "lost") return `${where}. The enquiry was closed earlier; they're writing again, so treat it as a fresh conversation that follows on from the thread.`;
+  return `${where}${c.treat_as ? ` (treated as ${c.treat_as})` : ""}.`;
 }
 
 function draftTool(settings: MessagingSettings): Anthropic.Tool {

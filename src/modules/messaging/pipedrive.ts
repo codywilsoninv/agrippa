@@ -52,6 +52,29 @@ export type PipedriveNote = {
   user_id: number | null;
 };
 
+export type PipedriveMailParty = { email_address?: string | null; name?: string | null; linked_person_id?: number | null };
+export type PipedriveMailThread = {
+  id: number;
+  subject: string;
+  last_message_at: string; // ISO
+  message_count: number;
+  deal_id: number | null;
+  parties: { from: PipedriveMailParty[]; to: PipedriveMailParty[] };
+};
+export type PipedriveMailMessage = {
+  id: number;
+  thread_id: number;
+  from: PipedriveMailParty[];
+  to: PipedriveMailParty[];
+  cc: PipedriveMailParty[];
+  subject: string;
+  /** Empty when no body could be fetched (reported in the refresh note). */
+  body_html: string;
+  /** Pipedrive's own "this was sent by us" flag, when it gives one. */
+  sent_flag: boolean | null;
+  at: string; // ISO
+};
+
 export type PipedrivePerson = {
   id: number;
   name: string;
@@ -74,18 +97,28 @@ type Envelope<T> = {
 export class PipedriveClient {
   private readonly base: string;
   private readonly token: string;
+  private readonly throttleMs: number;
+  private lastCallAt = 0;
 
-  constructor(secrets: Secrets) {
+  /** `throttleMs`: a small pause between calls (the refresh uses 150 ms) so bursts don't trip the rate limit. */
+  constructor(secrets: Secrets, opts: { throttleMs?: number } = {}) {
     const domain = secrets.company_domain.replace(/^https?:\/\//, "").replace(/\.pipedrive\.com.*$/, "").trim();
     if (!domain) throw new Error("Pipedrive company domain is missing");
     this.base = `https://${domain}.pipedrive.com`;
     this.token = secrets.api_token;
+    this.throttleMs = opts.throttleMs ?? 0;
   }
 
-  private async request<T>(method: "GET" | "POST", path: string, params: Record<string, string | number | undefined> = {}, body?: unknown): Promise<Envelope<T>> {
+  private async request<T>(method: "GET" | "POST", path: string, params: Record<string, string | number | undefined> = {}, body?: unknown, attempt = 0): Promise<Envelope<T>> {
     const url = new URL(path, this.base);
     for (const [k, v] of Object.entries(params)) if (v !== undefined) url.searchParams.set(k, String(v));
     url.searchParams.set("api_token", this.token);
+
+    if (this.throttleMs > 0) {
+      const wait = this.lastCallAt + this.throttleMs - Date.now();
+      if (wait > 0) await sleep(wait);
+      this.lastCallAt = Date.now();
+    }
 
     let res: Response;
     try {
@@ -99,11 +132,20 @@ export class PipedriveClient {
       throw new Error(`Couldn't reach Pipedrive (${path}): ${e instanceof Error ? e.message : "network error"}`);
     }
 
+    // Rate limited: wait what Pipedrive asks (else back off 1s, 2s, 4s), up to three retries.
+    if (res.status === 429 && attempt < 3) {
+      const after = Number(res.headers.get("retry-after"));
+      const waitMs = Math.min(Number.isFinite(after) && after > 0 ? after * 1000 : 1000 * 2 ** attempt, 10_000);
+      await sleep(waitMs);
+      return this.request<T>(method, path, params, body, attempt + 1);
+    }
+
     const json = (await res.json().catch(() => null)) as Envelope<T> | null;
     if (!res.ok || !json || json.success === false) {
       // Never echo the URL: it carries the token.
       const detail = json?.error ?? `HTTP ${res.status}`;
       if (res.status === 401) throw new Error("Pipedrive rejected the API token");
+      if (res.status === 429) throw new Error("Pipedrive rate limit hit; try the sweep again in a minute");
       throw new Error(`Pipedrive ${method} ${path} failed: ${detail}`);
     }
     return json;
@@ -144,6 +186,57 @@ export class PipedriveClient {
     return r.data.company_name || r.data.email || r.data.name || "Pipedrive";
   }
 
+  /** The token user's own email: mail from this address in the synced mailbox is ours (outbound). */
+  async myEmail(): Promise<string | null> {
+    const r = await this.request<{ email?: string }>("GET", "/api/v1/users/me");
+    return r.data.email?.toLowerCase() ?? null;
+  }
+
+  /** Deals in a pipeline changed since a time, any status (so won/lost moves land). Newest change first. */
+  async listDealsUpdated(pipelineId: number, sinceIso: string, max = 300): Promise<PipedriveDeal[]> {
+    type Raw = {
+      id: number;
+      title: string;
+      status: PipedriveDeal["status"];
+      stage_id: number;
+      pipeline_id: number;
+      person_id: number | null;
+      add_time: string;
+      update_time: string;
+      last_activity_date?: string | null;
+    };
+    const rows = await this.listAllV2<Raw>(
+      "/api/v2/deals",
+      { pipeline_id: pipelineId, updated_since: new Date(sinceIso).toISOString().replace(/\.\d{3}Z$/, "Z"), sort_by: "update_time", sort_direction: "desc" },
+      max,
+    );
+    return rows.filter((d) => d.pipeline_id === pipelineId && d.status !== "deleted").map(normaliseDeal);
+  }
+
+  /** One deal by id (any status), or null. */
+  async getDeal(id: number): Promise<PipedriveDeal | null> {
+    try {
+      const r = await this.request<Parameters<typeof normaliseDeal>[0] | null>("GET", `/api/v2/deals/${id}`);
+      return r.data ? normaliseDeal(r.data) : null;
+    } catch (e) {
+      if (e instanceof Error && /404|not found/i.test(e.message)) return null;
+      throw e;
+    }
+  }
+
+  /** Notes added or changed on or after a date (v1 start_date = YYYY-MM-DD), newest first, bounded. */
+  async listNotesSince(sinceIso: string, max = 200): Promise<PipedriveNote[]> {
+    const day = new Date(sinceIso).toISOString().slice(0, 10);
+    const rows = await this.listAllV1<PipedriveNote>("/api/v1/notes", { start_date: day, sort: "update_time DESC" }, max);
+    return rows.filter((n) => pipedriveTime(n.update_time ?? n.add_time).getTime() >= new Date(sinceIso).getTime());
+  }
+
+  /** Every CRM user's email: mail from these addresses is ours. */
+  async listUserEmails(): Promise<string[]> {
+    const r = await this.request<{ email?: string | null; active_flag?: boolean }[] | null>("GET", "/api/v1/users");
+    return (r.data ?? []).map((u) => (u.email ?? "").trim().toLowerCase()).filter(Boolean);
+  }
+
   /** Open deals in one pipeline (v2 honours pipeline_id; v1 ignores it). */
   async listOpenDeals(pipelineId: number): Promise<PipedriveDeal[]> {
     type Raw = {
@@ -158,19 +251,7 @@ export class PipedriveClient {
       last_activity_date?: string | null;
     };
     const rows = await this.listAllV2<Raw>("/api/v2/deals", { status: "open", pipeline_id: pipelineId, sort_by: "update_time", sort_direction: "desc" });
-    return rows
-      .filter((d) => d.pipeline_id === pipelineId) // belt and braces if the filter is ignored
-      .map((d) => ({
-        id: d.id,
-        title: d.title,
-        status: d.status,
-        stage_id: d.stage_id,
-        pipeline_id: d.pipeline_id,
-        person_id: d.person_id ?? null,
-        add_time: d.add_time,
-        update_time: d.update_time,
-        last_activity_date: d.last_activity_date ?? null,
-      }));
+    return rows.filter((d) => d.pipeline_id === pipelineId).map(normaliseDeal); // belt and braces if the filter is ignored
   }
 
   /** Activities updated since `since` (RFC3339), newest first, across all users. */
@@ -223,6 +304,123 @@ export class PipedriveClient {
     return { id: p.id, name: p.name, email: emails[0] ?? null, phone: phones[0] ?? null, emails, phones, add_time: p.add_time };
   }
 
+  /**
+   * People whose phone matches any of the spellings (v2 search, `fields=phone`),
+   * unioned by person id. Callers confirm the match strictly afterwards.
+   */
+  async searchPersonsByPhone(variants: string[]): Promise<PipedrivePerson[]> {
+    type Item = { item: { id: number; name: string; phones?: string[]; emails?: string[] } };
+    const byId = new Map<number, PipedrivePerson>();
+    for (const term of [...new Set(variants.filter((v) => v.trim().length >= 2))]) {
+      const r = await this.request<{ items: Item[] } | null>("GET", "/api/v2/persons/search", { term, fields: "phone", limit: 20 });
+      for (const { item } of r.data?.items ?? []) {
+        if (byId.has(item.id)) continue;
+        byId.set(item.id, {
+          id: item.id,
+          name: item.name,
+          email: item.emails?.[0] ?? null,
+          phone: item.phones?.[0] ?? null,
+          emails: item.emails ?? [],
+          phones: item.phones ?? [],
+          add_time: "",
+        });
+      }
+    }
+    return [...byId.values()];
+  }
+
+  /** Every non-deleted deal of a person (open, won, lost), newest update first. */
+  async listDealsForPerson(personId: number): Promise<PipedriveDeal[]> {
+    type Raw = Omit<PipedriveDeal, "person_id"> & { person_id: number | { value: number } | null };
+    const rows = await this.listAllV1<Raw>(`/api/v1/persons/${personId}/deals`, { status: "all_not_deleted" }, 100);
+    return rows
+      .map((d) => ({
+        id: d.id,
+        title: d.title,
+        status: d.status,
+        stage_id: d.stage_id,
+        pipeline_id: d.pipeline_id,
+        person_id: typeof d.person_id === "object" && d.person_id ? d.person_id.value : (d.person_id as number | null),
+        add_time: d.add_time,
+        update_time: d.update_time,
+        last_activity_date: d.last_activity_date ?? null,
+      }))
+      .sort((a, b) => pipedriveTime(b.update_time).getTime() - pipedriveTime(a.update_time).getTime());
+  }
+
+  /** Stage id → name across all pipelines (for context on deals outside the configured mapping). */
+  async listStages(): Promise<Map<number, { name: string; pipeline_id: number }>> {
+    const r = await this.request<{ id: number; name: string; pipeline_id: number }[] | null>("GET", "/api/v1/stages");
+    return new Map((r.data ?? []).map((s) => [s.id, { name: s.name, pipeline_id: s.pipeline_id }]));
+  }
+
+  // ---- Mailbox (Sales Inbox email sync), READ ONLY ------------------------
+  // Returns the API-token user's synced mailbox plus shared mail. Never call
+  // the update/delete thread endpoints (no mark-read, no archive).
+
+  /** Threads in a folder, newest activity first as far as the API orders them. `max` caps the scan. */
+  async listMailThreads(folder: "inbox" | "sent", max = 300): Promise<PipedriveMailThread[]> {
+    type Raw = {
+      id: number;
+      subject?: string | null;
+      last_message_timestamp?: string | null;
+      first_message_timestamp?: string | null;
+      message_count?: number;
+      deal_id?: number | null;
+      parties?: { to?: PipedriveMailParty[]; from?: PipedriveMailParty[]; cc?: PipedriveMailParty[] };
+      update_time?: string | null;
+    };
+    const rows = await this.listAllV1<Raw>("/api/v1/mailbox/mailThreads", { folder }, max);
+    return rows.map((r) => ({
+      id: r.id,
+      subject: r.subject ?? "",
+      last_message_at: pipedriveTime(r.last_message_timestamp ?? r.update_time ?? null).toISOString(),
+      message_count: r.message_count ?? 0,
+      deal_id: r.deal_id ?? null,
+      parties: { from: r.parties?.from ?? [], to: r.parties?.to ?? [] },
+    }));
+  }
+
+  /** Every message in a thread (20 API tokens each: call sparingly). Body is HTML, sometimes only via body_url. */
+  async getMailMessages(threadId: number): Promise<PipedriveMailMessage[]> {
+    type Raw = {
+      id: number;
+      from?: PipedriveMailParty[];
+      to?: PipedriveMailParty[];
+      cc?: PipedriveMailParty[];
+      subject?: string | null;
+      body?: string | null;
+      body_url?: string | null;
+      message_time?: string | null;
+      add_time?: string | null;
+      mail_thread_id?: number;
+      sent_flag?: boolean | number | null;
+    };
+    const r = await this.request<Raw[] | null>("GET", `/api/v1/mailbox/mailThreads/${threadId}/mailMessages`);
+    const out: PipedriveMailMessage[] = [];
+    for (const m of r.data ?? []) {
+      let body = m.body ?? "";
+      if (!body && m.body_url) body = await fetchBodyUrl(m.body_url);
+      if (!body) {
+        // The signed body_url can come back empty; the message endpoint can include the body with the token.
+        const one = await this.request<{ body?: string | null } | null>("GET", `/api/v1/mailbox/mailMessages/${m.id}`, { include_body: 1 }).catch(() => null);
+        body = one?.data?.body ?? "";
+      }
+      out.push({
+        id: m.id,
+        thread_id: m.mail_thread_id ?? threadId,
+        from: m.from ?? [],
+        to: m.to ?? [],
+        cc: m.cc ?? [],
+        subject: m.subject ?? "",
+        body_html: body,
+        sent_flag: typeof m.sent_flag === "boolean" ? m.sent_flag : typeof m.sent_flag === "number" ? m.sent_flag === 1 : null,
+        at: pipedriveTime(m.message_time ?? m.add_time ?? null).toISOString(),
+      });
+    }
+    return out;
+  }
+
   /** The only write this module makes to the CRM. `text` is plain text; Pipedrive stores HTML. Returns the note id. */
   async addNote(dealId: number, text: string): Promise<number> {
     const r = await this.request<{ id: number }>("POST", "/api/v1/notes", {}, { deal_id: dealId, content: textToNoteHtml(text) });
@@ -231,6 +429,44 @@ export class PipedriveClient {
 
   dealUrl(dealId: number): string {
     return `${this.base}/deal/${dealId}`;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function normaliseDeal(d: {
+  id: number;
+  title: string;
+  status: PipedriveDeal["status"];
+  stage_id: number;
+  pipeline_id: number;
+  person_id: number | { value: number } | null;
+  add_time: string;
+  update_time: string;
+  last_activity_date?: string | null;
+}): PipedriveDeal {
+  return {
+    id: d.id,
+    title: d.title,
+    status: d.status,
+    stage_id: d.stage_id,
+    pipeline_id: d.pipeline_id,
+    person_id: typeof d.person_id === "object" && d.person_id ? d.person_id.value : (d.person_id as number | null),
+    add_time: d.add_time,
+    update_time: d.update_time,
+    last_activity_date: d.last_activity_date ?? null,
+  };
+}
+
+/** body_url is a short-lived signed link to the message HTML; no token needed, nothing logged. */
+async function fetchBodyUrl(url: string): Promise<string> {
+  try {
+    const res = await fetch(url, { cache: "no-store" });
+    return res.ok ? await res.text() : "";
+  } catch {
+    return "";
   }
 }
 

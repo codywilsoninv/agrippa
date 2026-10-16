@@ -9,7 +9,8 @@ import { WorkspaceRename } from "@/components/workspace-rename";
 import { formatDateTime } from "@/components/format";
 import { loadModuleState } from "../messaging/data";
 import { renameWorkspace } from "../workspace-actions";
-import { saveProviderConnection, saveSettings, setModuleEnabled } from "./actions";
+import { resetMessaging, saveProviderConnection, saveSettings, setModuleEnabled } from "./actions";
+import { ResetMessaging } from "@/components/reset-messaging";
 import { PROVIDERS } from "@/lib/providers";
 import { MESSAGING_CONNECTIONS } from "@/modules/messaging/connections";
 
@@ -98,6 +99,7 @@ export default async function SettingsPage({ searchParams }: { searchParams: Sea
         <SettingsSummary settings={module.settings} />
         {admin ? <AcuityReference workspaceId={workspace.id} /> : null}
         <SettingsEditor initialJson={settingsJson} canEdit={admin} action={saveSettings} />
+        {admin ? <ResetMessaging action={resetMessaging} /> : null}
       </section>
 
       <section id="workspace" aria-labelledby="workspace-title" className="flex flex-col gap-4">

@@ -1,6 +1,7 @@
 // Messaging module: settings shape and validation. PURE (type imports only),
 // so the UI, the sweep and the unit tests share one source of truth.
 
+import { isKnownCountry, toE164 } from "./phone.ts";
 import { DEFAULT_SETTINGS, type MessagingSettings } from "./types.ts";
 
 /** Whatever is in workspace_modules.settings, merged over the defaults so it always has a shape. */
@@ -9,7 +10,13 @@ export function mergeSettings(raw: unknown): MessagingSettings {
   return {
     ...DEFAULT_SETTINGS,
     ...stored,
-    crm: { ...DEFAULT_SETTINGS.crm, ...(stored.crm ?? {}) },
+    crm: {
+      ...DEFAULT_SETTINGS.crm,
+      ...(stored.crm ?? {}),
+      ignore_phone_numbers: Array.isArray(stored.crm?.ignore_phone_numbers) ? stored.crm.ignore_phone_numbers : [],
+      email_skip_patterns: Array.isArray(stored.crm?.email_skip_patterns) ? stored.crm.email_skip_patterns : DEFAULT_SETTINGS.crm.email_skip_patterns,
+      own_email_addresses: Array.isArray(stored.crm?.own_email_addresses) ? stored.crm.own_email_addresses.map((a: string) => String(a).trim().toLowerCase()) : [],
+    },
     slots: { ...DEFAULT_SETTINGS.slots, ...(stored.slots ?? {}) },
     artists: Array.isArray(stored.artists) ? stored.artists : [],
     styles: Array.isArray(stored.styles) ? stored.styles : [],
@@ -25,6 +32,8 @@ export function validateSettings(s: MessagingSettings): string[] {
   if (!s.timezone.trim() || !isValidTimezone(s.timezone)) problems.push("Timezone is missing or not a valid IANA zone.");
   if (!s.voice.trim()) problems.push("Voice is empty: the drafts would have no tone to follow.");
   if (!s.email_subject.trim()) problems.push("Email subject is empty.");
+  if (!isKnownCountry(s.country)) problems.push(`Country "${s.country}" isn't one Agrippa knows how to read phone numbers for (AU, NZ, GB, US).`);
+  for (const n of s.crm.ignore_phone_numbers) if (!toE164(n, s.country)) problems.push(`ignore_phone_numbers: "${n}" isn't a phone number.`);
   if (s.artists.length === 0) problems.push("No artists on the roster.");
   if (!s.artists.some((a) => a.active && a.in_house)) problems.push("Nobody on the roster is both active and in-house, so no one can be offered.");
   for (const a of s.artists) {
@@ -45,6 +54,9 @@ export function validateSettings(s: MessagingSettings): string[] {
   if (!(s.crm.quiet_after_hours > 0)) problems.push("quiet_after_hours must be greater than 0.");
   if (!s.crm.sms_inbound_prefix.trim() || !s.crm.sms_outbound_prefix.trim()) problems.push("SMS activity subject prefixes are empty.");
   if (!isValidRegex(s.crm.chatbot_note_pattern)) problems.push("chatbot_note_pattern is not a valid regular expression.");
+  if (!isValidRegex(s.crm.form_note_pattern)) problems.push("form_note_pattern is not a valid regular expression.");
+  for (const a of s.crm.own_email_addresses) if (!/^[^@\s,()"]+@[^@\s,()"]+\.[^@\s,()"]+$/.test(a)) problems.push(`own_email_addresses: "${a}" isn't an email address.`);
+  for (const p of s.crm.email_skip_patterns) if (!isValidRegex(p)) problems.push(`email_skip_patterns: "${p}" is not a valid regular expression.`);
   if (!(s.slots.offer_count > 0)) problems.push("slots.offer_count must be at least 1.");
   if (!(s.slots.lookahead_days > 0)) problems.push("slots.lookahead_days must be at least 1.");
   return problems;

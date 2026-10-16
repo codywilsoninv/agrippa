@@ -9,6 +9,8 @@ type Props = {
   initialSubject: string;
   initialBody: string;
   previousError: string | null;
+  /** False when there is no Pipedrive deal to save the note to. */
+  hasDeal: boolean;
   approveAction: (prev: DecisionState, formData: FormData) => Promise<DecisionState>;
   denyAction: (formData: FormData) => void | Promise<void>;
 };
@@ -20,6 +22,7 @@ export function DraftEditor({
   initialSubject,
   initialBody,
   previousError,
+  hasDeal,
   approveAction,
   denyAction,
 }: Props) {
@@ -55,9 +58,19 @@ export function DraftEditor({
 
   const error = state?.error ?? previousError;
 
+  // With no Pipedrive deal there is nothing to save to, so approving means
+  // "I'll send this myself": put the final text on the clipboard as part of
+  // the same click, then submit.
+  async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
+    if (hasDeal) return;
+    const submitter = (e.nativeEvent as SubmitEvent).submitter as HTMLButtonElement | null;
+    if (submitter?.dataset.role !== "approve") return; // Deny has its own formAction
+    await copy();
+  }
+
   return (
     <div className="flex flex-col gap-4">
-      <form action={formAction} className="flex flex-col gap-4">
+      <form action={formAction} onSubmit={onSubmit} className="flex flex-col gap-4">
         <input type="hidden" name="action_id" value={actionId} />
         {channel === "email" ? (
           <div className="flex flex-col gap-1">
@@ -94,8 +107,8 @@ export function DraftEditor({
         ) : null}
 
         <div className="flex flex-wrap gap-2.5">
-          <button type="submit" disabled={pending} className="btn-primary disabled:opacity-60">
-            {pending ? "Saving…" : "Approve and save to Pipedrive"}
+          <button type="submit" data-role="approve" disabled={pending} className="btn-primary disabled:opacity-60">
+            {pending ? "Saving…" : hasDeal ? "Approve and save to Pipedrive" : "Copy and mark as sent"}
           </button>
           <button type="button" onClick={copy} className="btn-secondary">
             {copied === "done" ? "Copied" : copied === "failed" ? "Couldn't copy" : "Copy"}

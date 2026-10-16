@@ -49,6 +49,8 @@ export type MessagingSettings = {
   /** The person replies are written as (signs off). */
   sender_name: string;
   timezone: string; // IANA, e.g. Australia/Melbourne
+  /** ISO 3166-1 alpha-2; how local phone numbers without a country code are read. */
+  country: string;
   /** Label required by Founding doc 3 for anything sent on someone's behalf. */
   assistant_label: string;
   /** How the business writes to clients: tone, structure, banned words, worked examples. */
@@ -76,8 +78,16 @@ export type MessagingSettings = {
     sms_inbound_prefix: string;
     /** Activity subject prefix the SMS integration logs for an outbound text. */
     sms_outbound_prefix: string;
-    /** Regex (case-insensitive) that marks a deal note as a chatbot transcript. */
+    /** Regex (case-insensitive) that marks a deal note as a chatbot transcript (the client's own words). */
     chatbot_note_pattern: string;
+    /** Regex (case-insensitive) that marks a deal note as a form submission (the client's own words). */
+    form_note_pattern: string;
+    /** Email addresses that are the business's own (besides its CRM users), so mail from them is ours. */
+    own_email_addresses: string[];
+    /** E.164 numbers whose texts are never drafted for (staff, the business's own numbers). */
+    ignore_phone_numbers: string[];
+    /** Email senders (regex, case-insensitive, matched against the address) that are machines, not clients. */
+    email_skip_patterns: string[];
   };
   slots: {
     /** How many dates to offer. */
@@ -91,6 +101,7 @@ export const DEFAULT_SETTINGS: MessagingSettings = {
   business_name: "",
   sender_name: "",
   timezone: "Australia/Melbourne",
+  country: "AU",
   assistant_label: "Sent by our assistant",
   voice: "",
   price_book: "",
@@ -108,6 +119,13 @@ export const DEFAULT_SETTINGS: MessagingSettings = {
     sms_inbound_prefix: "Received SMS from",
     sms_outbound_prefix: "SMS Sent to",
     chatbot_note_pattern: "chat|bot",
+    form_note_pattern: "jotform|form submission|enquiry form",
+    own_email_addresses: [],
+    ignore_phone_numbers: [],
+    email_skip_patterns: [
+      "^(no-?reply|do-?not-?reply|donotreply|mailer-daemon|postmaster|bounce|notifications?|alerts?|calendar-notification|drive-shares)[@.+-]",
+      "@(acuityscheduling|squarespace|jotform|pipedrive|pipedrivemail|google|googlemail|calendly|clicksend|facebookmail|instagram|stripe|paypal|xero|canva|shopify|mailchimp|linkedin|tiktok)\\.",
+    ],
   },
   slots: { offer_count: 3, lookahead_days: 42 },
 };
@@ -138,10 +156,13 @@ export type DraftPayload = {
   rationale: string;
   /** Things the approver must do or check themselves. Never sent. */
   flags: string[];
+  /** Every conversation the draft drew on (deal notes, texts). conversation_id is the last of them, kept for compatibility. */
+  conversation_ids?: string[];
   /** Short quote from the enquiry, for context on screen. */
   enquiry_excerpt: string;
   contact: { email: string | null; phone: string | null; preferred: "sms" | "email" | null };
-  crm: { provider: "pipedrive"; deal_id: number; url: string | null };
+  /** Null when the text came from a number with no CRM deal (nothing to save the note to). */
+  crm: { provider: "pipedrive"; deal_id: number; url: string | null; status?: "open" | "won" | "lost"; stage_name?: string | null } | null;
 };
 
 /** actions.edited_payload when a person changes a draft before approving. */

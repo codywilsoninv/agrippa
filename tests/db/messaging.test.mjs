@@ -102,6 +102,22 @@ test("messages are walled off by workspace", async () => {
   );
 });
 
+test("a connection's sync state is walled off by workspace", async () => {
+  await as(A, () =>
+    db.query(
+      `insert into public.connections (workspace_id, provider, status, sync_state, last_synced_at)
+       values ($1, 'clicksend', 'connected', '{"cursor":"2026-10-16T00:00:00Z","new":5}', now())`,
+      [clientWs],
+    ),
+  );
+  const mine = await as(A, () => db.query(`select sync_state from public.connections where workspace_id = $1`, [clientWs]));
+  assert.equal(mine.rows[0].sync_state.new, 5);
+  const forB = await as(B, () => db.query(`select sync_state, last_synced_at from public.connections where workspace_id = $1`, [clientWs]));
+  assert.equal(forB.rows.length, 0);
+  const anyB = await as(B, () => db.query(`select id from public.connections where provider = 'clicksend'`));
+  assert.equal(anyB.rows.length, 0);
+});
+
 test("only one open draft per job", async () => {
   const ins = () =>
     as(A, () =>

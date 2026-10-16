@@ -104,3 +104,9 @@ export function editSize(original: string, edited: string): "none" | "small" | "
   if (ratio <= 0.35) return "medium";
   return "large";
 }
+
+/** A display locale from the workspace's country (no hard-coded region). */
+export function localeFor(country: string | null | undefined): string {
+  const c = (country ?? "").toUpperCase();
+  return c ? `en-${c}` : "en";
+}
