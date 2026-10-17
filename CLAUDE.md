@@ -17,6 +17,9 @@ If a change conflicts with a founding doc, stop and raise it with Cody rather th
 How the business runs (wedge → engagement → platform → library): `docs/operating-model.md`.
 Every module and project starts with a one-sentence **Solves:** line; don't build without one.
 
+What's being worked on (no fixed order): `docs/work-list.md`.
+Working from a business's own Claude project (e.g. Umbra): follow `docs/business-projects.md`.
+
 ## Non-negotiables
 - **Isolation:** every workspace-owned table has `workspace_id`, RLS policies via
   `private.is_member` / `private.is_admin`, and composite `(workspace_id, id)` foreign keys.
