@@ -82,11 +82,8 @@ Modelled on Palantir (quick win → forward-deployed engineers → one platform)
 3. **Promote what repeats:** a client-private pattern seen across clients moves to the library; an industry concept seen across companies moves to that industry's pack; a concept across industries moves to the core.
 4. **Measure the operation, not the model:** time per decision, error rate, volume per operator.
 
-## Build order (revised 14 Oct 2026)
-1. **Meetings module with its value report**, used on real meetings (Cody, Bridgette).
-2. **Builder kit:** client-private module template, ontology editor, test runner.
-3. **Delivery layer:** module versions and channels, staged rollout, rollback, health view.
-4. **First paid custom engagement**, ideally the studio.
+## What to build next
+There is no fixed build order (decided 17 Oct 2026). Priorities change often; see `docs/work-list.md` for the current list, each item with its Solves line and any real dependencies.
 
 ## Open questions
 - Brand: "Agrippa" is used by a US real-estate AI company (agrippa.com). Check trademark registers (IP Australia, USPTO; classes 9, 35, 42) before public launch.
