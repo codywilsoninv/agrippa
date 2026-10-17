@@ -11,7 +11,7 @@ export function NavLink({ href, label, badge }: { href: string; label: string; b
       href={href}
       aria-current={active ? "page" : undefined}
       className={`flex items-center justify-between gap-3 rounded-md px-3 py-2.5 no-underline min-h-11 ${
-        active ? "bg-nav-active text-white hover:text-white" : "text-nav-muted hover:text-white"
+        active ? "bg-nav-active text-white hover:text-white" : "text-nav-text hover:bg-nav-active hover:text-white"
       }`}
     >
       <span>{label}</span>
