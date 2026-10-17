@@ -33,39 +33,42 @@
   --tracking-wordmark: 0.06em;
 }
 
-html {
-  background: var(--color-ground);
-  color: var(--color-ink);
-  font-family: var(--font-sans);
-}
+/* Element defaults sit in the base layer so Tailwind utility classes (e.g. light nav text) override them. */
+@layer base {
+  html {
+    background: var(--color-ground);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+  }
 
-body {
-  margin: 0;
-  background: var(--color-ground);
-  color: var(--color-ink);
-  font-size: 14px;
-}
+  body {
+    margin: 0;
+    background: var(--color-ground);
+    color: var(--color-ink);
+    font-size: 14px;
+  }
 
-a {
-  color: var(--color-accent);
-}
-a:hover {
-  color: var(--color-accent-strong);
-}
+  a {
+    color: var(--color-accent);
+  }
+  a:hover {
+    color: var(--color-accent-strong);
+  }
 
-button {
-  font: inherit;
-  cursor: pointer;
-}
+  button {
+    font: inherit;
+    cursor: pointer;
+  }
 
-button:focus-visible,
-a:focus-visible,
-input:focus-visible,
-select:focus-visible,
-textarea:focus-visible,
-summary:focus-visible {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 2px;
+  button:focus-visible,
+  a:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible,
+  summary:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
 }
 
 /* Uppercase small label, letterspaced. */
